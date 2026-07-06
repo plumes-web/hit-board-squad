@@ -146,8 +146,11 @@ async function buildBoard(date, L){
       const d=await J(`https://api.the-odds-api.com/v4/sports/baseball_mlb/events/${ev.id}/odds?apiKey=${ODDS_KEY}&regions=us&bookmakers=draftkings&markets=batter_hits&oddsFormat=american`);
       const mk=d?.bookmakers?.[0]?.markets?.find(m=>m.key==='batter_hits');
       let n=0;
-      (mk?.outcomes||[]).forEach(oc=>{ if(oc.name==='Over'&&(oc.point===0.5||oc.point==null)&&oc.description){
-        const k=normName(oc.description), v=Math.round(oc.price); odds.set(k,v); OC.prices[k]=v; n++; } });
+      (mk?.outcomes||[]).forEach(oc=>{ if(!oc.description) return;
+        const k=normName(oc.description), line=oc.point??0.5, v=Math.round(oc.price);
+        if(oc.name==='Over'&&line===0.5){ odds.set(k,v); OC.prices[k]=v; n++; }
+        OC.ou=OC.ou||{}; const e=OC.ou[k]||(OC.ou[k]={line});
+        if(e.line===line){ if(oc.name==='Over') e.over=v; else e.under=v; } });
       if(n>0) st.priced=true;
     }
     console.log(`odds budget: ${OC.spent}/${DAILY_BUDGET} credits today · ${Object.values(OC.events).filter(e=>e.priced).length}/${todays.length} games priced`);
@@ -176,6 +179,8 @@ async function buildBoard(date, L){
     (sp?.stats?.[0]?.splits||[]).forEach(x=>{if(x.split?.code==='vl')r.avgVsL=num(x.stat.avg);if(x.split?.code==='vr')r.avgVsR=num(x.stat.avg);});
     if(bvp) for(const st of bvp.stats||[]) for(const s2 of st.splits||[]) if(s2.stat?.atBats!=null){r.bvpAB=s2.stat.atBats;r.bvpH=s2.stat.hits||0;r.bvpPA=s2.stat.plateAppearances||r.bvpAB;r.bvpAvg=num(s2.stat.avg);}
     r.dkOdds=odds.get(normName(c.name))??null;
+    const ouE=(L.oddsCache?.ou||{})[normName(c.name)];
+    if(ouE&&ouE.over!=null&&ouE.under!=null){ r.ouLine=ouE.line; r.ouOver=ouE.over; r.ouUnder=ouE.under; }
     r.dkImplied=r.dkOdds==null?null:(r.dkOdds<0?-r.dkOdds/(-r.dkOdds+100)*100:100/(r.dkOdds+100)*100);
     rows.push(r);
   }),6);
@@ -310,13 +315,68 @@ async function scanNews(rows){
   return signals;
 }
 
+
+// ---------- hits O/U engine (mirror of the dashboard) ----------
+function impliedPct(a){ return a==null?null:(a<0?-a/(-a+100)*100:100/(a+100)*100); }
+function ouContext(r){
+  if(r.ouLine==null||r.ouOver==null||r.ouUnder==null||r.estP==null) return null;
+  const n=r.expAB||3.8, p=1-Math.pow(1-r.estP/100,1/n);
+  const p1=r.estP/100, p2=1-Math.pow(1-p,n)-n*p*Math.pow(1-p,n-1);
+  const pOver=r.ouLine<1?p1:p2;
+  return {pOver, eO:pOver*100-impliedPct(r.ouOver), eU:(1-pOver)*100-impliedPct(r.ouUnder),
+          hitRate:r.l15GwAB>0?r.l15HitG/r.l15GwAB:0};
+}
+const OU_AFFINITY={
+  r5:(r,c)=>r.score!=null&&r.score>=62?{side:'O',w:r.score+c.eO*2}:r.score!=null&&r.score<=35?{side:'U',w:(100-r.score)+c.eU*2}:null,
+  mit:(r,c)=>{const e=Math.max(c.eO,c.eU); return e>=5?{side:c.eO>=c.eU?'O':'U',w:e*10}:null;},
+  chalky:(r,c)=>{const k=r.st?.k; if(k==null)return null;
+    if(k<=20&&c.hitRate>=.6)return{side:'O',w:(24-k)*4+c.eO*3};
+    if(k>=26&&(r.fPit??50)<=45)return{side:'U',w:k*2.5+c.eU*3}; return null;},
+  gapper:(r,c)=>{const x=r.st?.xba; if(x==null)return null;
+    if(x>=.27)return{side:'O',w:x*300+c.eO*3};
+    if(x<=.225&&(r.opp?.xba??.3)<=.235)return{side:'U',w:(240-x*1000)+c.eU*3}; return null;},
+  sal:(r,c)=>{const o=r.opp||{}; if(!o.hand||o.hand==='?')return null;
+    const bS=o.hand==='L'?r.avgVsL:r.avgVsR; if(bS==null)return null;
+    if(bS>=.29)return{side:'O',w:bS*500+c.eO*2};
+    if(bS<=.21)return{side:'U',w:(300-bS*1000)+c.eU*2}; return null;},
+  parkey:(r,c)=>{const pf=r.park?.pf??100;
+    if(pf>=104)return{side:'O',w:(pf-100)*8+c.eO*2};
+    if(pf<=96)return{side:'U',w:(100-pf)*8+c.eU*2}; return null;},
+  fadey:(r,c)=>{ if(r.ouOver>=100&&c.eO>=3)return{side:'O',w:r.ouOver+c.eO*10};
+    if(r.ouUnder>=100&&c.eU>=3)return{side:'U',w:r.ouUnder+c.eU*10}; return null;},
+  streaks:(r,c)=>{ if((r.streak??0)>=5)return{side:'O',w:r.streak*10+c.eO*2};
+    if(c.hitRate<=.4&&(r.streak??0)===0)return{side:'U',w:(60-c.hitRate*100)+c.eU*2}; return null;},
+  grinder:(r,c)=>{if((r.bvpPA??0)<12)return null;
+    if(r.bvpAvg>=.33)return{side:'O',w:r.bvpAvg*300+c.eO*2};
+    if(r.bvpAvg<=.18)return{side:'U',w:(120-r.bvpAvg*300)+c.eU*2}; return null;},
+};
+function hasOU(L,dt,bid){ const d=L.days[dt]; return !!d&&Object.values(d.rows).some(r=>r.ou&&r.ou[bid]); }
+function fileOU(L,dt,rows,now,pitchTime){
+  for(const [bid,aff] of Object.entries(OU_AFFINITY)){
+    if(hasOU(L,dt,bid)) continue;
+    const cands=[];
+    for(const r of rows){
+      if(pitchTime(r)<=now) continue;
+      const c=ouContext(r); if(!c) continue;
+      const a=aff(r,c); if(!a) continue;
+      cands.push({r,side:a.side,line:r.ouLine,odds:a.side==='O'?r.ouOver:r.ouUnder,w:a.w});
+    }
+    cands.sort((a,b)=>b.w-a.w);
+    const picks=cands.slice(0,5);
+    if(picks.length<3){ console.log(NAMES[bid]+' O/U: passes'); continue; }
+    picks.forEach(p=>{ record(L,dt,p.r); const row=L.days[dt].rows[p.r.id];
+      row.ou=row.ou||{}; row.ou[bid]={side:p.side,line:p.line,odds:p.odds,res:null}; });
+    wire(L,bid,`${NAMES[bid]} O/U card: ${picks.map(p=>`${p.r.name} ${p.side}${p.line}`).join(', ')}`);
+  }
+}
+
 // ---------- picks, revisions, settlement ----------
 function day(L,dt){ return L.days[dt]=L.days[dt]||{rows:{}}; }
 function record(L,dt,r){ const d=day(L,dt); const prev=d.rows[r.id]||{};
   d.rows[r.id]={id:r.id,n:r.name,t:r.team,g:r.game,rk:r.rank??prev.rk,gp:r.gamePk??prev.gp??null,
     sc:r.score,ep:r.estP!=null?Math.round(r.estP*10)/10:null,od:r.dkOdds??prev.od??null,op:r.opp?.name||'',
     picked:prev.picked||false,pickOdds:prev.pickOdds??null,bot:prev.bot||false,botOdds:prev.botOdds??null,
-    mit:prev.mit||false,mitOdds:prev.mitOdds??null,bks:prev.bks,res:prev.res??null}; }
+    mit:prev.mit||false,mitOdds:prev.mitOdds??null,bks:prev.bks,ou:prev.ou,res:prev.res??null}; }
 function setPick(L,dt,botId,r){ const d=day(L,dt); record(L,dt,r); const row=d.rows[r.id];
   if(botId==='r5'){row.bot=true;row.botOdds=r.dkOdds??row.od??null;}
   else if(botId==='mit'){row.mit=true;row.mitOdds=r.dkOdds??row.od??null;}
@@ -345,6 +405,14 @@ async function settle(L){
       const h=hits[r.id];
       if(h==null){ if(r.res==null){r.res='dnp';n++;} return; }
       const nr=h>=1?'win':'loss'; if(r.res!==nr){r.res=nr;n++;}
+    });
+    Object.values(L.days[dt].rows).forEach(r=>{
+      if(!r.ou) return; const h=hits[r.id];
+      Object.values(r.ou).forEach(e=>{
+        if(e.res==='win'||e.res==='loss') return;
+        if(h==null){ e.res='dnp'; return; }
+        e.res=(e.side==='O'?h>e.line:h<e.line)?'win':'loss'; n++;
+      });
     });
     console.log('settled',n,'rows for',dt);
   }
@@ -391,6 +459,7 @@ async function settle(L){
     }
   }
   console.log('board:',rows.length,'hitters ·',rows.filter(r=>r.confirmed).length,'confirmed ·',rows.filter(r=>r.dkOdds!=null).length,'priced ·',signals.size,'news flags');
+  fileOU(L, date, rows.filter(r=>!signals.has(r.id)), now, pitchTime);
   await saveLedger(L);
   console.log('run complete', new Date().toISOString());
 })();
