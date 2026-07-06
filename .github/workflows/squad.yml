@@ -1,0 +1,24 @@
+name: Autonomous Squad Runner
+on:
+  schedule:
+    # Every 30 min, 10:00–23:30 ET (14:00–03:30 UTC) — covers lineup posts through West Coast finals
+    - cron: '0,30 14-23 * * *'
+    - cron: '0,30 0-3 * * *'
+  workflow_dispatch: {}   # manual "Run now" button in the Actions tab
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run the squad
+        env:
+          JSONBIN_KEY: ${{ secrets.JSONBIN_KEY }}
+          JSONBIN_BIN: ${{ secrets.JSONBIN_BIN }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: node autonomous/runner.mjs
