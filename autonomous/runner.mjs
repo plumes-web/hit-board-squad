@@ -59,7 +59,7 @@ async function saveLedger(L){
 function wire(L,who,text){ L.wire.push({t:Date.now(),who,text}); console.log(`[wire:${who}] ${text}`); }
 
 // ---------- board build ----------
-async function buildBoard(date){
+async function buildBoard(date, L){
   const season=date.slice(0,4);
   const [sched,teams]=await Promise.all([
     J(`${API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher,lineups`),
@@ -124,18 +124,37 @@ async function buildBoard(date){
     Object.assign(o,{xba:num(sv.xba),kpct:num(sv.k_percent),whiff:num(sv.whiff_percent),hardhit:num(sv.hard_hit_percent),ld:num(sv.linedrives_percent),izcontact:num(sv.iz_contact_percent)});
     pInfo[pr.id]=o;
   }),5);
-  // odds
-  const odds=new Map();
-  if(ODDS_KEY){
-    const evs=await J(`https://api.the-odds-api.com/v4/sports/baseball_mlb/events?apiKey=${ODDS_KEY}`);
+  // odds — FREE-TIER BUDGET MODE:
+  //   · each game's props fetched at most twice (initial + one retry if empty)
+  //   · only inside the 11:00–19:30 ET posting window
+  //   · hard cap of 16 credits/day; prices cached in the ledger all day and
+  //     shared with the dashboard, so nothing is ever fetched twice.
+  const DAILY_BUDGET=16, WINDOW=[11,19.5];
+  if(L.oddsCache?.date!==date) L.oddsCache={date, prices:{}, events:{}, spent:0};
+  const OC=L.oddsCache;
+  const odds=new Map(Object.entries(OC.prices));
+  const etHour=(()=>{const p=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour:'numeric',minute:'numeric',hour12:false}).formatToParts(new Date());
+    return +p.find(x=>x.type==='hour').value + (+p.find(x=>x.type==='minute').value)/60;})();
+  if(ODDS_KEY && etHour>=WINDOW[0] && etHour<=WINDOW[1] && OC.spent<DAILY_BUDGET){
+    const evs=await J(`https://api.the-odds-api.com/v4/sports/baseball_mlb/events?apiKey=${ODDS_KEY}`); // events list = 0 credits
     const todays=(evs||[]).filter(e=>new Date(e.commence_time).toLocaleDateString('en-CA',{timeZone:'America/New_York'})===date);
-    await pool(todays.map(ev=>async()=>{
+    for(const ev of todays){
+      const st=OC.events[ev.id]||(OC.events[ev.id]={tries:0,priced:false});
+      if(st.priced || st.tries>=2 || OC.spent>=DAILY_BUDGET) continue;
+      if(new Date(ev.commence_time).getTime()<=Date.now()) continue; // game started, prices moot
+      st.tries++; OC.spent++;
       const d=await J(`https://api.the-odds-api.com/v4/sports/baseball_mlb/events/${ev.id}/odds?apiKey=${ODDS_KEY}&regions=us&bookmakers=draftkings&markets=batter_hits&oddsFormat=american`);
       const mk=d?.bookmakers?.[0]?.markets?.find(m=>m.key==='batter_hits');
-      (mk?.outcomes||[]).forEach(oc=>{ if(oc.name==='Over'&&(oc.point===0.5||oc.point==null)&&oc.description) odds.set(normName(oc.description),Math.round(oc.price)); });
-    }),4);
-    console.log('DK prices:',odds.size);
+      let n=0;
+      (mk?.outcomes||[]).forEach(oc=>{ if(oc.name==='Over'&&(oc.point===0.5||oc.point==null)&&oc.description){
+        const k=normName(oc.description), v=Math.round(oc.price); odds.set(k,v); OC.prices[k]=v; n++; } });
+      if(n>0) st.priced=true;
+    }
+    console.log(`odds budget: ${OC.spent}/${DAILY_BUDGET} credits today · ${Object.values(OC.events).filter(e=>e.priced).length}/${todays.length} games priced`);
+  } else if(ODDS_KEY){
+    console.log(`odds: using cache (${odds.size} prices) — ${etHour<WINDOW[0]||etHour>WINDOW[1]?'outside posting window':'daily budget reached'}`);
   }
+  console.log('DK prices:',odds.size);
   // per-candidate detail
   const rows=[];
   await pool(cand.map(c=>async()=>{
@@ -336,7 +355,7 @@ async function settle(L){
   const date=todayISO();
   const L=await loadLedger();
   await settle(L);
-  const board=await buildBoard(date);
+  const board=await buildBoard(date, L);
   if(!board){ wire(L,'sys','No MLB games today — settled the books and went back to sleep.'); await saveLedger(L); return; }
   const {rows}=board; rows.forEach((r,i)=>r.rank=i+1);
   const now=Date.now();
