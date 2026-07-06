@@ -242,17 +242,23 @@ function top(rows,fn){ return rows.map(r=>({r,sc:fn(r)})).filter(x=>x.sc!=null).
 const RISK_WORDS=/(scratch|scratched|out of (the )?lineup|not in (the )?lineup|placed on (the )?(10|15|60)?-?\s?day il|to the il|injured list|day.to.day|left tonight|exit(ed|s)? (the )?game|benched|sitting|getting a day|precautionary|tightness|soreness|sore |strain|sprain|discomfort)/i;
 async function scanNews(rows){
   const texts=[];
-  const rj=await J('https://www.reddit.com/r/fantasybaseball/new.json?limit=60',{headers:{'User-Agent':'hitboard-runner/1.0'}});
-  (rj?.data?.children||[]).forEach(c=>texts.push(c.data.title+' '+(c.data.selftext||'').slice(0,300)));
-  const rb=await J('https://www.reddit.com/r/baseball/new.json?limit=40',{headers:{'User-Agent':'hitboard-runner/1.0'}});
-  (rb?.data?.children||[]).forEach(c=>texts.push(c.data.title));
-  for(const feed of ['https://www.mlb.com/feeds/news/rss.xml','https://www.espn.com/espn/rss/mlb/news','https://www.rotowire.com/rss/news.php?sport=MLB']){
-    const t=await T(feed,{headers:{'User-Agent':'hitboard-runner/1.0'}});
-    if(t) [...t.matchAll(/<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/title>/g)].forEach(m=>texts.push(m[1]));
+  const UA={headers:{'User-Agent':'Mozilla/5.0 (hitboard-runner)'}};
+  const FEEDS=[
+    'https://news.google.com/rss/search?q=MLB+(scratched+OR+%22out+of+the+lineup%22+OR+%22placed+on%22+OR+%22injured+list%22)+when:1d&hl=en-US&gl=US&ceid=US:en',
+    'https://news.google.com/rss/search?q=MLB+lineup+today+when:1d&hl=en-US&gl=US&ceid=US:en',
+    'https://www.mlbtraderumors.com/feed',
+    'https://www.mlb.com/feeds/news/rss.xml',
+    'https://www.espn.com/espn/rss/mlb/news',
+    'https://www.rotowire.com/rss/news.php?sport=MLB',
+    'https://www.cbssports.com/rss/headlines/mlb/'
+  ];
+  for(const feed of FEEDS){
+    const t=await T(feed,UA);
+    if(!t){ console.log('feed unavailable:',feed.split('/')[2]); continue; }
+    [...t.matchAll(/<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/title>/g)].forEach(m=>texts.push(m[1]));
+    [...t.matchAll(/<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/description>/g)].slice(0,40).forEach(m=>texts.push(m[1].replace(/<[^>]+>/g,' ').slice(0,300)));
   }
-  const bs=await J('https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?q=MLB%20scratched&limit=25');
-  (bs?.posts||[]).forEach(p=>texts.push(p.record?.text||''));
-  console.log('news items scanned:',texts.length);
+  console.log('news items scanned:',texts.length,'from',FEEDS.length,'feeds');
   // keyword pass: match risky text to players on today's board
   const signals=new Map(); // playerId -> reason
   for(const tx of texts){
@@ -335,8 +341,9 @@ async function settle(L){
     const bot=NAMES[st.id];
     const wanted=st.pick(rows.filter(r=>!signals.has(r.id) && pitchTime(r)>now)); // never pick flagged/started players
     const have=currentPicks(L,date,st.id);
+    if(have.length) console.log(bot+': holding '+have.length+' locked pick(s), checking for scratches…');
     if(!have.length){
-      if(!wanted.length){ console.log(bot,'passes'); continue; }
+      if(!wanted.length){ console.log(bot+': passes (nothing qualifies yet)'); continue; }
       wanted.forEach(r=>setPick(L,date,st.id,r));
       wire(L,st.id,`${bot} filed: ${wanted.map(r=>r.name).join(', ')}${wanted.some(r=>r.dkOdds==null)?' (some unpriced)':''}`);
       continue;
@@ -357,6 +364,7 @@ async function settle(L){
       }
     }
   }
+  console.log('board:',rows.length,'hitters ·',rows.filter(r=>r.confirmed).length,'confirmed ·',rows.filter(r=>r.dkOdds!=null).length,'priced ·',signals.size,'news flags');
   await saveLedger(L);
   console.log('run complete', new Date().toISOString());
 })();
