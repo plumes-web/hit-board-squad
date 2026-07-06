@@ -259,15 +259,22 @@ async function scanNews(rows){
     [...t.matchAll(/<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/description>/g)].slice(0,40).forEach(m=>texts.push(m[1].replace(/<[^>]+>/g,' ').slice(0,300)));
   }
   console.log('news items scanned:',texts.length,'from',FEEDS.length,'feeds');
-  // keyword pass: match risky text to players on today's board
+  // keyword pass: STRICT full-name matching only (word-boundary), so
+  // "Evan Phillips" can never flag "Derek Hill" via the 'hill' substring.
   const signals=new Map(); // playerId -> reason
+  const nameRe=new Map();
+  for(const r of rows){
+    const first=normName(r.name.split(' ')[0]), lastN=normName(lastName(r.name));
+    if(lastN.length<3) continue;
+    // "mookie betts" OR "m. betts" / "m betts", as whole words
+    nameRe.set(r.id, new RegExp(`\\b(?:${first}|${first[0]}\\.?)[ ]${lastN}\\b`));
+  }
   for(const tx of texts){
     if(!RISK_WORDS.test(tx)) continue;
     const low=normName(tx);
     for(const r of rows){
-      const ln=normName(lastName(r.name));
-      if(ln.length>3 && low.includes(ln) && low.includes(normName(r.name.split(' ')[0]).slice(0,3)))
-        if(!signals.has(r.id)) signals.set(r.id,tx.slice(0,140));
+      const re=nameRe.get(r.id);
+      if(re && re.test(low) && !signals.has(r.id)) signals.set(r.id,tx.slice(0,140));
     }
   }
   // optional Claude comprehension layer: confirm/deny keyword hits
