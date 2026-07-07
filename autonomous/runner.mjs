@@ -379,6 +379,10 @@ const OU_AFFINITY={
     if(r.bvpAvg>=.33)return{side:'O',w:r.bvpAvg*300+c.eO*2};
     if(r.bvpAvg<=.18)return{side:'U',w:(120-r.bvpAvg*300)+c.eU*2}; return null;},
 };
+function holdsOUOver05(L,dt,bid,id){
+  const e=L.days[dt]?.rows[id]?.ou?.[bid];
+  return !!(e && e.side==='O' && e.line<1);
+}
 function hasOU(L,dt,bid){ const d=L.days[dt]; return !!d&&Object.values(d.rows).some(r=>r.ou&&r.ou[bid]); }
 function fileOU(L,dt,rows,now,pitchTime){
   for(const [bid,aff] of Object.entries(OU_AFFINITY)){
@@ -388,6 +392,7 @@ function fileOU(L,dt,rows,now,pitchTime){
       if(pitchTime(r)<=now) continue;
       const c=ouContext(r); if(!c) continue;
       const a=aff(r,c); if(!a) continue;
+      if(a.side==='O' && r.ouLine<1 && hasPick(L,dt,bid,r.id)) continue; // same bet as hit card
       cands.push({r,side:a.side,line:r.ouLine,odds:a.side==='O'?r.ouOver:r.ouUnder,w:a.w});
     }
     cands.sort((a,b)=>b.w-a.w);
@@ -462,7 +467,7 @@ async function settle(L){
 
   for(const st of STRATS){
     const bot=NAMES[st.id];
-    const wanted=st.pick(rows.filter(r=>!signals.has(r.id) && pitchTime(r)>now)); // never pick flagged/started players
+    const wanted=st.pick(rows.filter(r=>!signals.has(r.id) && pitchTime(r)>now && !holdsOUOver05(L,date,st.id,r.id))); // never flagged/started/duplicate-of-O/U
     const have=currentPicks(L,date,st.id);
     if(have.length) console.log(bot+': holding '+have.length+' locked pick(s), checking for scratches…');
     if(!have.length){
@@ -480,7 +485,7 @@ async function settle(L){
       const scratched = r && Object.values(rows.filter(x=>x.teamId===r.teamId&&x.confirmed)).length>0 && !r.confirmed;
       if(flagged||scratched){
         unpick(L,date,st.id,id);
-        const pool_=st.pick(rows.filter(x=>!signals.has(x.id)&&pitchTime(x)>now&&!hasPick(L,date,st.id,x.id)));
+        const pool_=st.pick(rows.filter(x=>!signals.has(x.id)&&pitchTime(x)>now&&!hasPick(L,date,st.id,x.id)&&!holdsOUOver05(L,date,st.id,x.id)));
         const sub=pool_.find(x=>x.id!==id);
         if(sub) setPick(L,date,st.id,sub);
         wire(L,st.id,`${bot} changed his mind: OUT ${r?.name||id} (${flagged?'news: '+signals.get(id).slice(0,90):'not in the posted lineup'})${sub?' → IN '+sub.name:''}`);
