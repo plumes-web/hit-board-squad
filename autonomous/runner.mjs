@@ -91,7 +91,13 @@ async function buildBoard(date, L){
       seasonAvg:num(s.stat.avg),seasonPA:s.stat.plateAppearances||0,recAvg:num(r.avg),recPA:r.plateAppearances||0};})
     .filter(p=>p.recPA>=20&&p.seasonPA>=60);
   cand.forEach(p=>{p.prelim=(scale(p.recAvg,.18,.34)??40)*.6+(scale(p.seasonAvg,.18,.34)??40)*.4+(lineupOrder[p.id]?8:0);});
-  cand.sort((a,b)=>b.prelim-a.prelim); cand=cand.slice(0,90);
+  cand.sort((a,b)=>b.prelim-a.prelim);
+  // cold tier: weakest qualifying bats — Under candidates for the O/U engine
+  const hot=cand.slice(0,90), inPool=new Set(hot.map(c=>c.id));
+  const cold=cand.slice(-35).filter(c=>!inPool.has(c.id));
+  cold.forEach(c=>c.coldTier=true);
+  cand=[...hot,...cold];
+  console.log('pool:',hot.length,'hitters +',cold.length,'cold-tier bats');
   // savant
   async function savant(type,sel){
     const t=await T(`https://baseballsavant.mlb.com/leaderboard/custom?year=${season}&type=${type}&filter=&min=10&selections=${sel}&chart=false&x=xba&y=xba&r=no&chartType=beeswarm&csv=true`);
@@ -129,7 +135,7 @@ async function buildBoard(date, L){
   //   · only inside the 11:00–19:30 ET posting window
   //   · hard cap of 16 credits/day; prices cached in the ledger all day and
   //     shared with the dashboard, so nothing is ever fetched twice.
-  const DAILY_BUDGET=16, WINDOW=[11,19.5];
+  const DAILY_BUDGET=34, WINDOW=[11,22.5];
   if(L.oddsCache?.date!==date) L.oddsCache={date, prices:{}, events:{}, spent:0};
   const OC=L.oddsCache;
   const odds=new Map(Object.entries(OC.prices));
@@ -139,9 +145,16 @@ async function buildBoard(date, L){
     const evs=await J(`https://api.the-odds-api.com/v4/sports/baseball_mlb/events?apiKey=${ODDS_KEY}`); // events list = 0 credits
     const todays=(evs||[]).filter(e=>new Date(e.commence_time).toLocaleDateString('en-CA',{timeZone:'America/New_York'})===date);
     for(const ev of todays){
-      const st=OC.events[ev.id]||(OC.events[ev.id]={tries:0,priced:false});
-      if(st.priced || st.tries>=2 || OC.spent>=DAILY_BUDGET) continue;
+      const st=OC.events[ev.id]||(OC.events[ev.id]={tries:0,priced:false,closed:false});
       if(new Date(ev.commence_time).getTime()<=Date.now()) continue; // game started, prices moot
+      const minsToPitch=(new Date(ev.commence_time).getTime()-Date.now())/60000;
+      const closingWindow = minsToPitch<=100;
+      // closing pass: one refetch near first pitch — completes late-posting players (bench bats)
+      // and captures true closing prices so backfilled units are accurate
+      if(st.priced && !(closingWindow && !st.closed)) continue;
+      if(!st.priced && st.tries>=2) continue;
+      if(OC.spent>=DAILY_BUDGET) continue;
+      if(closingWindow) st.closed=true;
       st.tries++; OC.spent++;
       const d=await J(`https://api.the-odds-api.com/v4/sports/baseball_mlb/events/${ev.id}/odds?apiKey=${ODDS_KEY}&regions=us&bookmakers=draftkings&markets=batter_hits&oddsFormat=american`);
       const mk=d?.bookmakers?.[0]?.markets?.find(m=>m.key==='batter_hits');
@@ -153,6 +166,22 @@ async function buildBoard(date, L){
         if(e.line===line){ if(oc.name==='Over') e.over=v; else e.under=v; } });
       if(n>0) st.priced=true;
     }
+    // backfill null odds throughout today's ledger from the freshest cache
+    let bf=0;
+    const d=L.days[date];
+    if(d) Object.values(d.rows).forEach(r=>{
+      const k=normName(r.n), v=OC.prices[k]!=null?+OC.prices[k]:null;
+      if(v!=null){
+        if(r.od==null){r.od=v;bf++;}
+        if(r.picked&&r.pickOdds==null){r.pickOdds=v;bf++;}
+        if(r.bot&&r.botOdds==null){r.botOdds=v;bf++;}
+        if(r.mit&&r.mitOdds==null){r.mitOdds=v;bf++;}
+        if(r.bks) Object.keys(r.bks).forEach(b=>{if(r.bks[b]==null){r.bks[b]=v;bf++;}});
+      }
+      const e=(OC.ou||{})[k];
+      if(e&&r.ou) Object.values(r.ou).forEach(x=>{ if(x.odds==null&&x.line===e.line){x.odds=x.side==='O'?e.over:e.under; if(x.odds!=null)bf++;} });
+    });
+    if(bf) console.log('backfilled',bf,'missing price fields in today\'s ledger');
     console.log(`odds budget: ${OC.spent}/${DAILY_BUDGET} credits today · ${Object.values(OC.events).filter(e=>e.priced).length}/${todays.length} games priced`);
   } else if(ODDS_KEY){
     console.log(`odds: using cache (${odds.size} prices) — ${etHour<WINDOW[0]||etHour>WINDOW[1]?'outside posting window':'daily budget reached'}`);
