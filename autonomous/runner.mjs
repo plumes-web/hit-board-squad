@@ -13,7 +13,7 @@
 // ============================================================================
 import process from 'node:process';
 
-const RUNNER_BUILD='2026-07-08.5';
+const RUNNER_BUILD='2026-07-08.6';
 const API='https://statsapi.mlb.com/api/v1';
 const JB='https://api.jsonbin.io/v3/b';
 const ENV=k=>process.env[k]||'';
@@ -51,7 +51,54 @@ function parseCSV(text){ const rows=[];let row=[],cur='',q=false;
 // ---------- ledger I/O (jsonbin) ----------
 async function loadLedger(){
   const d=await J(`${JB}/${JSONBIN_BIN}/latest`,{headers:{'X-Master-Key':JSONBIN_KEY}});
-  const rec=d?.record||{}; return {days:rec.days||{}, wire:rec.wire||[]};
+  const rec=d?.record||{}; const L={...rec, days:rec.days||{}, wire:rec.wire||[]};
+  if(L.mutBinId){
+    const m=await J(`${JB}/${L.mutBinId}/latest`,{headers:{'X-Master-Key':JSONBIN_KEY}});
+    if(m?.record){ L.mut=m.record.mut||L.mut; L.mdays=m.record.mdays||L.mdays; }
+    else { L._mutLoadFailed=true; console.log('WARNING: colony bin unreachable — freezing all mutant ops this run so the colony cannot be overwritten'); }
+  }
+  return L;
+}
+async function ensureMutBin(L){
+  if(L.mutBinId) return;
+  const r=await fetch(`${JB}`,{method:'POST',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY,'X-Bin-Private':'true','X-Bin-Name':'hit-board-mutants'},body:JSON.stringify({mut:L.mut||null,mdays:L.mdays||{}})});
+  if(r.ok){ const d=await r.json(); L.mutBinId=d?.metadata?.id||null; console.log('created mutant bin:',L.mutBinId); }
+  else console.log('mutant bin creation failed HTTP',r.status);
+}
+function foldOldDays(L){
+  // roll settled days older than 7d into compact season aggregates, then prune detail
+  L.agg=L.agg||{books:{},series:{},folded:{}};
+  const cutoff=daysAgo(todayISO(),7), hardCut=daysAgo(todayISO(),25);
+  const BOOK_IDS=['you','r5','mit','chalky','gapper','sal','parkey','fadey','streaks','grinder'];
+  const flag={you:r=>r.picked,r5:r=>r.bot,mit:r=>r.mit};
+  const oddsOf={you:r=>r.pickOdds??r.od,r5:r=>r.botOdds??r.od,mit:r=>r.mitOdds??r.od};
+  Object.keys(L.days).sort().forEach(dt=>{
+    if(dt>=cutoff||L.agg.folded[dt]) return;
+    const rows=Object.values(L.days[dt].rows);
+    if(rows.some(r=>r.res==null&&(r.picked||r.bot||r.mit||(r.bks&&Object.keys(r.bks).length)))) return; // not fully settled
+    const dayU={};
+    rows.forEach(r=>{
+      BOOK_IDS.forEach(b=>{
+        const has=flag[b]?flag[b](r):!!(r.bks&&r.bks[b]!==undefined);
+        if(has&&(r.res==='win'||r.res==='loss')){
+          const od=oddsOf[b]?oddsOf[b](r):r.bks[b]??r.od;
+          const u=r.res==='win'?(od!=null?(od>0?od/100:100/-od):0.4):-1;
+          const A=L.agg.books[b]=L.agg.books[b]||{w:0,l:0,u:0,ow:0,ol:0,ouU:0,dnp:0};
+          if(r.res==='win')A.w++; else A.l++; A.u+=u; dayU[b]=(dayU[b]||0)+u;
+        }
+        if(has&&r.res==='dnp'){ const A=L.agg.books[b]=L.agg.books[b]||{w:0,l:0,u:0,ow:0,ol:0,ouU:0,dnp:0}; A.dnp++; }
+      });
+      if(r.ou) Object.entries(r.ou).forEach(([b,e])=>{
+        if(e.res!=='win'&&e.res!=='loss') return;
+        const A=L.agg.books[b]=L.agg.books[b]||{w:0,l:0,u:0,ow:0,ol:0,ouU:0,dnp:0};
+        const u=e.res==='win'?(e.odds!=null?(e.odds>0?e.odds/100:100/-e.odds):0.4):-1;
+        if(e.res==='win')A.ow++; else A.ol++; A.ouU+=u; dayU[b]=(dayU[b]||0)+u;
+      });
+    });
+    Object.entries(dayU).forEach(([b,u])=>{ (L.agg.series[b]=L.agg.series[b]||[]).push({d:dt,u:Math.round(u*100)/100}); L.agg.series[b]=L.agg.series[b].slice(-120); });
+    L.agg.folded[dt]=true;
+  });
+  Object.keys(L.days).filter(d=>d<hardCut&&L.agg.folded[d]).forEach(d=>delete L.days[d]);
 }
 function pruneLedger(L){
   // keep the blob inside jsonbin limits: full board detail for recent days only,
@@ -79,14 +126,28 @@ function emergencyTrim(L){
   });
 }
 async function saveLedger(L){
+  foldOldDays(L);
   pruneLedger(L);
+  await ensureMutBin(L);
+  // colony lives in its own bin — split before sizing
+  const M={mut:L.mut||null, mdays:L.mdays||{}};
+  const core={...L};
+  if(L.mutBinId){ delete core.mut; delete core.mdays; }   // no bin yet? colony rides in the core rather than vanishing
+  if(L.mutBinId && !L._mutLoadFailed){
+    const mb=JSON.stringify(M);
+    const rm=await fetch(`${JB}/${L.mutBinId}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body:mb});
+    console.log('mutant bin:',(mb.length/1024).toFixed(0),'KB —',rm.ok?'saved OK':'SAVE FAILED HTTP '+rm.status);
+  }
+  return saveCore(core);
+}
+async function saveCore(L){
   L.wire=L.wire.slice(-100); L.lastRun=new Date().toISOString();
   let body=JSON.stringify(L);
   console.log('ledger blob:', (body.length/1024).toFixed(0),'KB');
   let r=await fetch(`${JB}/${JSONBIN_BIN}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body});
   if(r.ok){ console.log('ledger saved OK'); return; }
-  console.log('SAVE FAILED HTTP',r.status,'— emergency trim & retry');
-  emergencyTrim(L); body=JSON.stringify(L);
+  console.log('CORE SAVE FAILED HTTP',r.status,'— emergency trim & retry');
+  emergencyTrim(L); delete L.mut; delete L.mdays; body=JSON.stringify(L);
   console.log('trimmed blob:', (body.length/1024).toFixed(0),'KB');
   r=await fetch(`${JB}/${JSONBIN_BIN}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body});
   console.log(r.ok?'retry save OK':'RETRY STILL FAILING HTTP '+r.status+' — the bin may be over its plan size limit');
@@ -545,6 +606,7 @@ function describeGenome(g){
 }
 
 function mutInit(L){
+  if(L._mutLoadFailed) return;
   if(L.mut && L.mut.roster) return;
   const rng=mulberry32(20260706);
   const roster={};
@@ -561,6 +623,7 @@ function mutAlert(L,k,msg){ L.mut.alerts.push({t:Date.now(),k,msg}); L.mut.alert
 function activeMutants(L){ return Object.values(L.mut.roster).filter(m=>!m.absorbed); }
 
 function mutantsPick(L, date, rows, now, pitchTime){
+  if(L._mutLoadFailed) return;
   mutInit(L);
   L.mdays=L.mdays||{};
   if(L.mdays[date] && L.mdays[date].filed) return;
@@ -602,6 +665,7 @@ function mutantsPick(L, date, rows, now, pitchTime){
 }
 
 function mutantsSettle(L, dt, hits){
+  if(L._mutLoadFailed) return;
   const md=L.mdays?.[dt]; if(!md||md.settled) return;
   const dayU={};
   Object.entries(md.rows).forEach(([pid,row])=>{
@@ -639,6 +703,7 @@ function mutantsSettle(L, dt, hits){
 
 function fitness(m){ return m.rec.hist.slice(-7).reduce((s,x)=>s+x.u,0); }
 function mutantsEvolve(L, dt){
+  if(L._mutLoadFailed) return;
   if(L.mut.evoDone[dt]) return;
   const act=activeMutants(L).filter(m=>m.rec.hist.length>=2);
   if(act.length<10){ L.mut.evoDone[dt]=true; return; }
