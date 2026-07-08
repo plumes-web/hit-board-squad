@@ -13,7 +13,7 @@
 // ============================================================================
 import process from 'node:process';
 
-const RUNNER_BUILD='2026-07-08.4';
+const RUNNER_BUILD='2026-07-08.5';
 const API='https://statsapi.mlb.com/api/v1';
 const JB='https://api.jsonbin.io/v3/b';
 const ENV=k=>process.env[k]||'';
@@ -755,5 +755,6 @@ const __main=(async()=>{ if(process.env.MUT_TEST==='1') return;
   mutantsEvolve(L, daysAgo(date,1));
   await saveLedger(L);
   console.log('run complete', new Date().toISOString());
-});
+})();
+if(process.env.MUT_TEST!=='1') await __main;   // ensures the run completes before the process exits
 export {mutInit,mutantsPick,mutantsSettle,mutantsEvolve,activeMutants};
