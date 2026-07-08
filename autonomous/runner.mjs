@@ -440,6 +440,7 @@ async function settle(L){
       if(h==null){ if(r.res==null){r.res='dnp';n++;} return; }
       const nr=h>=1?'win':'loss'; if(r.res!==nr){r.res=nr;n++;}
     });
+    mutInit(L); mutantsSettle(L, dt, hits);
     Object.values(L.days[dt].rows).forEach(r=>{
       if(!r.ou) return; const h=hits[r.id];
       Object.values(r.ou).forEach(e=>{
@@ -452,8 +453,222 @@ async function settle(L){
   }
 }
 
+// ================= THE MUTANTS — a 100-bot evolutionary colony =================
+// Deterministic genetic strategy search over the same board data the squad uses.
+// Each mutant = a genome: feature weights + filters + bet-type preferences.
+// Daily lifecycle: pick → settle → evolve (learn from peers, merge, lock, unfuse).
+// Everything is seeded & auditable; every change is logged with a rationale.
+function mulberry32(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+function seedFrom(str){ let h=0; for(const c of str) h=Math.imul(31,h)+c.charCodeAt(0)|0; return h; }
+
+const MUT_PRE=['Glitch','Vex','Nova','Krank','Byte','Fizz','Mook','Zap','Drift','Hex'];
+const MUT_SUF=['tron','ide','us','by','mo','zilla','nik','form','ling','ex'];
+function mutName(i){ return MUT_PRE[i%10]+MUT_SUF[Math.floor(i/10)%10]; }
+
+const GENE_KEYS=['form','hr','stk','k','xba','hh','plat','bvp','park','h9','edge','prob'];
+function randGenome(rng){
+  const w={}; GENE_KEYS.forEach(k=>w[k]=Math.round(rng()*100)/100);
+  return { w,
+    f:{ minHR:.35+rng()*.25, maxK:20+rng()*12, minProb:52+rng()*12, conf:rng()<.5 },
+    bt:{ hit:rng() },                       // probability mass on 1+hit vs O/U betting
+    ouLo:25+rng()*15, ouHi:60+rng()*20,     // score thresholds for Under / Over
+    n:3+Math.floor(rng()*3) };
+}
+function mutFeatures(r){
+  const o=r.opp||{}, st=r.st||{};
+  const bS=o.hand==='L'?r.avgVsL:r.avgVsR;
+  return {
+    form: scale(r.l15Avg,.18,.34)??50,
+    hr:  (r.l15GwAB>0? r.l15HitG/r.l15GwAB*100 : 50),
+    stk: Math.min((r.streak??0)*12,100),
+    k:   st.k!=null? 100-scale(st.k,14,32) : 50,
+    xba: st.xba!=null? scale(st.xba,.21,.30) : 50,
+    hh:  st.hh!=null? scale(st.hh,28,50) : 50,
+    plat:bS!=null? scale(bS,.18,.34) : 50,
+    bvp: (r.bvpPA>=8&&r.bvpAvg!=null)? scale(r.bvpAvg,.15,.40) : 50,
+    park:scale(r.park?.pf??100,92,112)??50,
+    h9:  o.h9L5!=null? scale(o.h9L5,6.5,12.5) : 50,
+    edge:r.edge!=null? clamp(50+r.edge*4,0,100) : 50,
+    prob:r.estP!=null? scale(r.estP,45,80) : 50 };
+}
+function mutScore(g,r){
+  const f=mutFeatures(r); let s=0,wsum=0;
+  GENE_KEYS.forEach(k=>{ s+=f[k]*g.w[k]; wsum+=g.w[k]; });
+  return wsum>0? s/wsum : 0;
+}
+function genomeSim(a,b){
+  let dot=0,na=0,nb=0;
+  GENE_KEYS.forEach(k=>{ dot+=a.w[k]*b.w[k]; na+=a.w[k]**2; nb+=b.w[k]**2; });
+  return dot/Math.sqrt(na*nb||1);
+}
+function describeGenome(g){
+  const top=[...GENE_KEYS].sort((x,y)=>g.w[y]-g.w[x]).slice(0,3);
+  const L={form:'recent form',hr:'hit-game consistency',stk:'streak momentum',k:'contact (low-K)',xba:'batted-ball quality',hh:'hard contact',plat:'platoon edges',bvp:'BvP history',park:'park environment',h9:'leaky pitchers',edge:'market mispricing',prob:'raw hit probability'};
+  const bt=g.bt.hit>=.66?'mostly 1+hit bets':g.bt.hit<=.33?'mostly O/U bets':'a mix of 1+hit and O/U';
+  return `Hunts ${L[top[0]]}, ${L[top[1]]} and ${L[top[2]]}; plays ${bt}, ${g.n} picks; needs ${(g.f.minHR*100).toFixed(0)}%+ hit-rate, K% under ${g.f.maxK.toFixed(0)}${g.f.conf?', confirmed lineups only':''}.`;
+}
+
+function mutInit(L){
+  if(L.mut && L.mut.roster) return;
+  const rng=mulberry32(20260706);
+  const roster={};
+  for(let i=0;i<100;i++){
+    const id='M'+String(i+1).padStart(3,'0');
+    roster[id]={ id, name:mutName(i), g:randGenome(rng),
+      rec:{w:0,l:0,u:0,ow:0,ol:0,ouU:0,cs:0,cl:0,hist:[]},
+      locked:false, absorbed:null, mergedFrom:null, log:[{d:'genesis',note:'Spawned with a random genome. '+'Ready to evolve.'}] };
+  }
+  L.mut={roster, alerts:[], series:[], evoDone:{}};
+  console.log('MUTANTS: colony of 100 spawned');
+}
+function mutAlert(L,k,msg){ L.mut.alerts.push({t:Date.now(),k,msg}); L.mut.alerts=L.mut.alerts.slice(-40); console.log('[mutant-alert:'+k+'] '+msg); }
+function activeMutants(L){ return Object.values(L.mut.roster).filter(m=>!m.absorbed); }
+
+function mutantsPick(L, date, rows, now, pitchTime){
+  mutInit(L);
+  L.mdays=L.mdays||{};
+  if(L.mdays[date] && L.mdays[date].filed) return;
+  const avail=rows.filter(r=>pitchTime(r)>now);
+  if(!avail.length) return;
+  const priced=avail.filter(r=>r.dkOdds!=null);
+  if(priced.length<20) { console.log('MUTANTS: waiting for a priced board'); return; }
+  const md=L.mdays[date]=L.mdays[date]||{rows:{},filed:false};
+  const rng=mulberry32(seedFrom(date)^99);
+  let filed=0;
+  for(const m of activeMutants(L)){
+    const g=m.g;
+    const pool=avail.filter(r=>{
+      const hrOK=(r.l15GwAB>0? r.l15HitG/r.l15GwAB : 0)>=g.f.minHR;
+      const kOK=(r.st?.k??24)<=g.f.maxK;
+      const pOK=(r.estP??0)>=g.f.minProb;
+      return hrOK&&kOK&&pOK&&(!g.f.conf||r.confirmed);
+    });
+    const scored=pool.map(r=>({r,sc:mutScore(g,r)})).sort((a,b)=>b.sc-a.sc);
+    let placed=0;
+    for(const {r,sc} of scored){
+      if(placed>=g.n) break;
+      const wantHit=rng()<g.bt.hit;
+      const row=md.rows[r.id]=md.rows[r.id]||{n:r.name,t:r.team,op:r.opp?.name||'',od:r.dkOdds??null,ouL:r.ouLine??null,ouO:r.ouOver??null,ouU:r.ouUnder??null,res:null,mk:{}};
+      if(wantHit && r.dkOdds!=null && !row.mk[m.id]){
+        row.mk[m.id]=['H',null,r.dkOdds,null]; placed++;
+      } else if(r.ouLine!=null && r.ouOver!=null && r.ouUnder!=null && !row.mk[m.id]){
+        const side=sc>=g.ouHi?'O':sc<=g.ouLo?'U':null;
+        if(side==='O'&&r.ouLine<1&&row.mk[m.id]) continue;
+        if(side){ row.mk[m.id]=['OU',side,side==='O'?r.ouOver:r.ouUnder,r.ouLine]; placed++; }
+      }
+    }
+    if(placed) filed++;
+  }
+  md.filed=true;
+  console.log('MUTANTS:',filed,'of',activeMutants(L).length,'filed for',date);
+  // trim old detail days to keep the bin small
+  Object.keys(L.mdays).sort().slice(0,-7).forEach(d=>delete L.mdays[d]);
+}
+
+function mutantsSettle(L, dt, hits){
+  const md=L.mdays?.[dt]; if(!md||md.settled) return;
+  const dayU={};
+  Object.entries(md.rows).forEach(([pid,row])=>{
+    const h=hits[pid];
+    Object.entries(row.mk).forEach(([mid,pk])=>{
+      if(pk[4]!=null) return; // already graded
+      let res;
+      if(h==null) res='p';
+      else if(pk[0]==='H') res=h>=1?'w':'l';
+      else res=((pk[1]==='O'? h>pk[3] : h<pk[3]))?'w':'l';
+      pk[4]=res;
+      const m=L.mut.roster[mid]; if(!m) return;
+      const odds=pk[2];
+      const u=res==='w'?(odds!=null?(odds>0?odds/100:100/-odds):0.4):res==='l'?-1:0;
+      dayU[mid]=(dayU[mid]||0)+u;
+      if(pk[0]==='H'){ if(res==='w')m.rec.w++; else if(res==='l')m.rec.l++; if(res!=='p')m.rec.u+=u; }
+      else { if(res==='w')m.rec.ow++; else if(res==='l')m.rec.ol++; if(res!=='p')m.rec.ouU+=u; }
+    });
+  });
+  Object.entries(dayU).forEach(([mid,u])=>{
+    const m=L.mut.roster[mid]; if(!m) return;
+    m.rec.hist.push({d:dt,u:Math.round(u*100)/100}); m.rec.hist=m.rec.hist.slice(-21);
+    if(u>0){ m.rec.cs++; m.rec.cl=0; } else if(u<0){ m.rec.cl++; m.rec.cs=0; }
+    // user rule: strategy change + 2 consecutive profitable days = front-page alert
+    if(m.chgAt && m.rec.cs>=2){
+      mutAlert(L,'hot',`🔥 ${m.name} retooled its strategy on ${m.chgAt} and just posted ${m.rec.cs} straight profitable days (+${m.rec.hist.slice(-m.rec.cs).reduce((s,x)=>s+x.u,0).toFixed(1)}u). The tweak is working.`);
+      m.chgAt=null;
+    }
+  });
+  const colonyU=Object.values(dayU).reduce((s,u)=>s+u,0);
+  L.mut.series.push({d:dt,u:Math.round(colonyU*10)/10}); L.mut.series=L.mut.series.slice(-200);
+  md.settled=true;
+  console.log('MUTANTS: settled',dt,'colony day units',colonyU.toFixed(1));
+}
+
+function fitness(m){ return m.rec.hist.slice(-7).reduce((s,x)=>s+x.u,0); }
+function mutantsEvolve(L, dt){
+  if(L.mut.evoDone[dt]) return;
+  const act=activeMutants(L).filter(m=>m.rec.hist.length>=2);
+  if(act.length<10){ L.mut.evoDone[dt]=true; return; }
+  const rng=mulberry32(seedFrom(dt)^7);
+  const ranked=[...act].sort((a,b)=>fitness(b)-fitness(a));
+  const top=ranked.slice(0,Math.max(5,Math.floor(ranked.length*.1)));
+  // LOCK: 5 straight profitable days = strategy found, frozen forever
+  for(const m of act){
+    if(!m.locked && m.rec.cs>=5){
+      m.locked=true;
+      m.log.push({d:dt,note:'LOCKED IN. Five consecutive profitable days — this genome no longer changes. '+describeGenome(m.g)});
+      mutAlert(L,'lock',`🔒 ${m.name} has locked its strategy after 5 straight green days (${uNum(fitness(m))} last 7). It will never change again.`);
+    }
+  }
+  // LEARN: strugglers study a top performer and shift toward its genome
+  const strugglers=ranked.slice(Math.floor(ranked.length*.6)).filter(m=>!m.locked);
+  for(const m of strugglers){
+    if(rng()>.3) continue;
+    const mentor=top[Math.floor(rng()*top.length)];
+    GENE_KEYS.forEach(k=>{ m.g.w[k]=Math.round((m.g.w[k]*.7+mentor.g.w[k]*.3+(rng()-.5)*.1)*100)/100; });
+    if(rng()<.4) m.g.f.minHR=clamp(m.g.f.minHR+(rng()-.5)*.06,.3,.65);
+    if(rng()<.4) m.g.f.minProb=clamp(m.g.f.minProb+(rng()-.5)*3,50,70);
+    m.chgAt=dt; m.rec.cs=0;
+    m.log.push({d:dt,note:`Studied ${mentor.name}'s approach (7-day ${uNum(fitness(mentor))}) and shifted 30% toward its weighting. New identity: ${describeGenome(m.g)}`});
+    m.log=m.log.slice(-4);
+  }
+  // MERGE: two complementary top performers fuse (max 1 per day)
+  const cands=ranked.slice(0,Math.floor(ranked.length*.3)).filter(m=>!m.locked&&!m.mergedFrom);
+  outer:
+  for(let i=0;i<cands.length&&rng()<.4;i++){
+    for(let j=i+1;j<cands.length;j++){
+      const a=cands[i],b=cands[j];
+      if(genomeSim(a.g,b.g)<.55){
+        GENE_KEYS.forEach(k=>a.g.w[k]=Math.round(((a.g.w[k]+b.g.w[k])/2)*100)/100);
+        a.g.n=Math.min(5,Math.max(a.g.n,b.g.n));
+        a.mergedFrom=[{id:a.id,name:a.name,g:JSON.parse(JSON.stringify(a.g))},{id:b.id,name:b.name,g:JSON.parse(JSON.stringify(b.g))}];
+        const newName=a.name.slice(0,Math.ceil(a.name.length/2))+b.name.slice(Math.floor(b.name.length/2));
+        a.log.push({d:dt,note:`FUSED with ${b.name} — our genomes disagreed enough to be complementary (similarity ${(genomeSim(a.g,b.g)*100).toFixed(0)}%). Now operating as ${newName}. ${describeGenome(a.g)}`});
+        mutAlert(L,'merge',`🧬 ${a.name} + ${b.name} have merged into ${newName} — complementary strategies, both top-30% fitness. The colony is now ${activeMutants(L).length-1} strong.`);
+        a.name=newName; a.chgAt=dt; a.rec.cs=0;
+        b.absorbed=a.id;
+        break outer;
+      }
+    }
+  }
+  // UNFUSE: a merged mutant on a 3-day slide petitions ADMIN, splits next day
+  for(const m of act){
+    if(m.mergedFrom && !m.unfusePending && m.rec.cl>=3){
+      m.unfusePending=dt;
+      mutAlert(L,'admin',`⚠️ ADMIN: ${m.name} (a fusion) has lost 3 straight days and requests to un-fuse back into ${m.mergedFrom[0].name} + ${m.mergedFrom[1].name}. Auto-approving on the next cycle unless the colony turns.`);
+    } else if(m.mergedFrom && m.unfusePending && m.unfusePending!==dt){
+      const [pa,pb]=m.mergedFrom;
+      m.name=pa.name; m.g=pa.g; m.mergedFrom=null; m.unfusePending=null; m.chgAt=dt; m.rec.cs=0; m.rec.cl=0;
+      m.log.push({d:dt,note:`Un-fused by ADMIN approval — reverted to ${pa.name}'s original genome.`});
+      const b=L.mut.roster[pb.id];
+      if(b){ b.absorbed=null; b.g=pb.g; b.rec.cs=0; b.rec.cl=0; b.log.push({d:dt,note:`Released from the ${pa.name} fusion — back to my own genome. ${describeGenome(b.g)}`}); }
+      mutAlert(L,'admin',`✂️ Un-fuse executed: ${pa.name} and ${pb.name} are independent mutants again. Colony ${activeMutants(L).length}.`);
+    }
+  }
+  L.mut.evoDone[dt]=true;
+  const keep={}; Object.keys(L.mut.evoDone).sort().slice(-15).forEach(k=>keep[k]=true); L.mut.evoDone=keep;
+}
+function uNum(u){ return (u>=0?'+':'')+u.toFixed(1)+'u'; }
+
 // ---------- main ----------
-(async()=>{
+const __main=(async()=>{ if(process.env.MUT_TEST==='1') return;
   const date=todayISO();
   const L=await loadLedger();
   await settle(L);
@@ -494,6 +709,9 @@ async function settle(L){
   }
   console.log('board:',rows.length,'hitters ·',rows.filter(r=>r.confirmed).length,'confirmed ·',rows.filter(r=>r.dkOdds!=null).length,'priced ·',signals.size,'news flags');
   fileOU(L, date, rows.filter(r=>!signals.has(r.id)), now, pitchTime);
+  mutantsPick(L, date, rows.filter(r=>!signals.has(r.id)), now, pitchTime);
+  mutantsEvolve(L, daysAgo(date,1));
   await saveLedger(L);
   console.log('run complete', new Date().toISOString());
-})();
+});
+export {mutInit,mutantsPick,mutantsSettle,mutantsEvolve,activeMutants};
