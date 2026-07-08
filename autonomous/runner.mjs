@@ -269,8 +269,8 @@ function mittsEval(r){ const o=r.opp||{};
   return{ok,prob,edge};
 }
 const STRATS=[
- {id:'r5', pick:rows=>rows.filter(r=>r.score!=null).slice(0,5)},
- {id:'mit', pick:rows=>rows.map(r=>({r,m:mittsEval(r)})).filter(x=>x.m.ok).sort((a,b)=>b.m.edge-a.m.edge).slice(0,5).map(x=>x.r)},
+ {id:'r5', pick:rows=>rows.filter(r=>r.score!=null).slice(0,3)},
+ {id:'mit', pick:rows=>rows.map(r=>({r,m:mittsEval(r)})).filter(x=>x.m.ok).sort((a,b)=>b.m.edge-a.m.edge).slice(0,3).map(x=>x.r)},
  {id:'chalky', pick:rows=>top(rows,r=>{const st=r.st||{},o=r.opp||{};const hr=r.l15GwAB>0?r.l15HitG/r.l15GwAB:0;
    if((st.k??99)>23||hr<.55)return null;return(26-(st.k??24))*3+(26-(st.whiff??24))*2+hr*60+(o.whiff!=null?(24-o.whiff)*1.5:0)+(r.l15Avg??.25)*60;})},
  {id:'gapper', pick:rows=>top(rows,r=>{const st=r.st||{},o=r.opp||{};if((st.xba??0)<.255)return null;
@@ -289,7 +289,7 @@ const STRATS=[
    return r.bvpAvg*200*Math.log(r.bvpPA)+(r.opp?.h9L5!=null?r.opp.h9L5*3:24);})},
 ];
 const NAMES={r5:'Rusty',mit:'Mitts',chalky:'Chalky',gapper:'Gapper',sal:'Southpaw Sal',parkey:'Parkey',fadey:'Fadey',streaks:'Streaks',grinder:'The Grinder'};
-function top(rows,fn){ return rows.map(r=>({r,sc:fn(r)})).filter(x=>x.sc!=null).sort((a,b)=>b.sc-a.sc).slice(0,5).map(x=>x.r); }
+function top(rows,fn){ return rows.map(r=>({r,sc:fn(r)})).filter(x=>x.sc!=null).sort((a,b)=>b.sc-a.sc).slice(0,3).map(x=>x.r); }
 
 // ---------- news wire ----------
 const RISK_WORDS=/(scratch|scratched|out of (the )?lineup|not in (the )?lineup|placed on (the )?(10|15|60)?-?\s?day il|to the il|injured list|day.to.day|left tonight|exit(ed|s)? (the )?game|benched|sitting|getting a day|precautionary|tightness|soreness|sore |strain|sprain|discomfort)/i;
@@ -396,7 +396,7 @@ function fileOU(L,dt,rows,now,pitchTime){
       cands.push({r,side:a.side,line:r.ouLine,odds:a.side==='O'?r.ouOver:r.ouUnder,w:a.w});
     }
     cands.sort((a,b)=>b.w-a.w);
-    const picks=cands.slice(0,5);
+    const picks=cands.slice(0,3);
     if(picks.length<3){ console.log(NAMES[bid]+' O/U: passes'); continue; }
     picks.forEach(p=>{ record(L,dt,p.r); const row=L.days[dt].rows[p.r.id];
       row.ou=row.ou||{}; row.ou[bid]={side:p.side,line:p.line,odds:p.odds,res:null}; });
@@ -472,7 +472,7 @@ function randGenome(rng){
     f:{ minHR:.35+rng()*.25, maxK:20+rng()*12, minProb:52+rng()*12, conf:rng()<.5 },
     bt:{ hit:rng() },                       // probability mass on 1+hit vs O/U betting
     ouLo:25+rng()*15, ouHi:60+rng()*20,     // score thresholds for Under / Over
-    n:3+Math.floor(rng()*3) };
+    n:2+Math.floor(rng()*2) };
 }
 function mutFeatures(r){
   const o=r.opp||{}, st=r.st||{};
@@ -546,7 +546,7 @@ function mutantsPick(L, date, rows, now, pitchTime){
     const scored=pool.map(r=>({r,sc:mutScore(g,r)})).sort((a,b)=>b.sc-a.sc);
     let placed=0;
     for(const {r,sc} of scored){
-      if(placed>=g.n) break;
+      if(placed>=Math.min(g.n,3)) break;
       const wantHit=rng()<g.bt.hit;
       const row=md.rows[r.id]=md.rows[r.id]||{n:r.name,t:r.team,op:r.opp?.name||'',od:r.dkOdds??null,ouL:r.ouLine??null,ouO:r.ouOver??null,ouU:r.ouUnder??null,res:null,mk:{}};
       if(wantHit && r.dkOdds!=null && !row.mk[m.id]){
