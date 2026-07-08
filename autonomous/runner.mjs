@@ -13,6 +13,7 @@
 // ============================================================================
 import process from 'node:process';
 
+const RUNNER_BUILD='2026-07-08.4';
 const API='https://statsapi.mlb.com/api/v1';
 const JB='https://api.jsonbin.io/v3/b';
 const ENV=k=>process.env[k]||'';
@@ -52,9 +53,43 @@ async function loadLedger(){
   const d=await J(`${JB}/${JSONBIN_BIN}/latest`,{headers:{'X-Master-Key':JSONBIN_KEY}});
   const rec=d?.record||{}; return {days:rec.days||{}, wire:rec.wire||[]};
 }
+function pruneLedger(L){
+  // keep the blob inside jsonbin limits: full board detail for recent days only,
+  // older days keep just the rows somebody actually bet on
+  const cutoff=daysAgo(todayISO(),7);
+  Object.keys(L.days).filter(d=>d<cutoff).forEach(d=>{
+    const rows=L.days[d].rows;
+    Object.keys(rows).forEach(id=>{ const r=rows[id];
+      const kept=r.picked||r.bot||r.mit||(r.bks&&Object.keys(r.bks).length)||(r.ou&&Object.keys(r.ou).length);
+      if(!kept) delete rows[id];
+    });
+  });
+  if(L.mut) Object.values(L.mut.roster).forEach(m=>{ m.log=(m.log||[]).slice(-3); m.rec.hist=(m.rec.hist||[]).slice(-14); });
+  if(L.mdays) Object.keys(L.mdays).sort().slice(0,-5).forEach(d=>delete L.mdays[d]);
+}
+function emergencyTrim(L){
+  L.mdays={}; L.wire=L.wire.slice(-20);
+  if(L.mut) Object.values(L.mut.roster).forEach(m=>{ m.log=(m.log||[]).slice(-1); m.rec.hist=(m.rec.hist||[]).slice(-7); });
+  Object.keys(L.days).sort().slice(0,-5).forEach(d=>{
+    const rows=L.days[d].rows;
+    Object.keys(rows).forEach(id=>{ const r=rows[id];
+      const kept=r.picked||r.bot||r.mit||(r.bks&&Object.keys(r.bks).length)||(r.ou&&Object.keys(r.ou).length);
+      if(!kept) delete rows[id];
+    });
+  });
+}
 async function saveLedger(L){
-  L.wire=L.wire.slice(-120); L.lastRun=new Date().toISOString();
-  await fetch(`${JB}/${JSONBIN_BIN}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body:JSON.stringify(L)});
+  pruneLedger(L);
+  L.wire=L.wire.slice(-100); L.lastRun=new Date().toISOString();
+  let body=JSON.stringify(L);
+  console.log('ledger blob:', (body.length/1024).toFixed(0),'KB');
+  let r=await fetch(`${JB}/${JSONBIN_BIN}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body});
+  if(r.ok){ console.log('ledger saved OK'); return; }
+  console.log('SAVE FAILED HTTP',r.status,'— emergency trim & retry');
+  emergencyTrim(L); body=JSON.stringify(L);
+  console.log('trimmed blob:', (body.length/1024).toFixed(0),'KB');
+  r=await fetch(`${JB}/${JSONBIN_BIN}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body});
+  console.log(r.ok?'retry save OK':'RETRY STILL FAILING HTTP '+r.status+' — the bin may be over its plan size limit');
 }
 function wire(L,who,text){ L.wire.push({t:Date.now(),who,text}); console.log(`[wire:${who}] ${text}`); }
 
@@ -66,6 +101,7 @@ async function buildBoard(date, L){
     J(`${API}/teams?sportId=1&season=${season}`)]);
   const abbr={};(teams?.teams||[]).forEach(t=>abbr[t.id]=t.abbreviation||t.name);
   const games=sched?.dates?.[0]?.games||[];
+  console.log('schedule:',games.length,'game(s) for',date, sched?'':'(schedule fetch FAILED)');
   if(!games.length) return null;
   const ctx={},lineupOrder={},firstPitch={};
   for(const g of games){
@@ -670,10 +706,16 @@ function uNum(u){ return (u>=0?'+':'')+u.toFixed(1)+'u'; }
 // ---------- main ----------
 const __main=(async()=>{ if(process.env.MUT_TEST==='1') return;
   const date=todayISO();
+  console.log('runner build',RUNNER_BUILD,'· ET date',date);
   const L=await loadLedger();
+  console.log('ledger loaded:',Object.keys(L.days||{}).length,'day(s) · mutants in blob:',L.mut?Object.keys(L.mut.roster).length:0);
+  mutInit(L);   // the colony exists from the very first run, games or not
   await settle(L);
   const board=await buildBoard(date, L);
-  if(!board){ wire(L,'sys','No MLB games today — settled the books and went back to sleep.'); await saveLedger(L); return; }
+  if(!board){
+    console.log('EARLY EXIT: no completed schedule/games returned for',date,'— saving colony state and sleeping');
+    wire(L,'sys','No MLB games found for '+date+' — colony state saved, back to sleep.');
+    await saveLedger(L); return; }
   const {rows}=board; rows.forEach((r,i)=>r.rank=i+1);
   const now=Date.now();
   const pitchTime=r=>r.firstPitch?new Date(r.firstPitch).getTime():now+3e7;
