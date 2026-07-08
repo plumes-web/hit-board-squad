@@ -100,30 +100,27 @@ function foldOldDays(L){
   });
   Object.keys(L.days).filter(d=>d<hardCut&&L.agg.folded[d]).forEach(d=>delete L.days[d]);
 }
-function pruneLedger(L){
-  // keep the blob inside jsonbin limits: full board detail for recent days only,
-  // older days keep just the rows somebody actually bet on
-  const cutoff=daysAgo(todayISO(),7);
-  Object.keys(L.days).filter(d=>d<cutoff).forEach(d=>{
-    const rows=L.days[d].rows;
-    Object.keys(rows).forEach(id=>{ const r=rows[id];
-      const kept=r.picked||r.bot||r.mit||(r.bks&&Object.keys(r.bks).length)||(r.ou&&Object.keys(r.ou).length);
-      if(!kept) delete rows[id];
-    });
+function stripDay(rows){
+  Object.keys(rows).forEach(id=>{ const r=rows[id];
+    const kept=r.picked||r.bot||r.mit||(r.bks&&Object.keys(r.bks).length)||(r.ou&&Object.keys(r.ou).length);
+    if(!kept) delete rows[id];
   });
-  if(L.mut) Object.values(L.mut.roster).forEach(m=>{ m.log=(m.log||[]).slice(-3); m.rec.hist=(m.rec.hist||[]).slice(-14); });
-  if(L.mdays) Object.keys(L.mdays).sort().slice(0,-5).forEach(d=>delete L.mdays[d]);
+}
+function pruneLedger(L){
+  // core diet: TODAY keeps the full board (live tracker / cards need it);
+  // every past day keeps only rows somebody actually bet on
+  const today=todayISO();
+  Object.keys(L.days).forEach(d=>{ if(d<today) stripDay(L.days[d].rows); });
+  if(L.mut) Object.values(L.mut.roster).forEach(m=>{ m.log=(m.log||[]).slice(-2); m.rec.hist=(m.rec.hist||[]).slice(-10); });
+  if(L.mdays) Object.keys(L.mdays).sort().slice(0,-3).forEach(d=>delete L.mdays[d]);
+  L.wire=(L.wire||[]).slice(-60);
 }
 function emergencyTrim(L){
-  L.mdays={}; L.wire=L.wire.slice(-20);
-  if(L.mut) Object.values(L.mut.roster).forEach(m=>{ m.log=(m.log||[]).slice(-1); m.rec.hist=(m.rec.hist||[]).slice(-7); });
-  Object.keys(L.days).sort().slice(0,-5).forEach(d=>{
-    const rows=L.days[d].rows;
-    Object.keys(rows).forEach(id=>{ const r=rows[id];
-      const kept=r.picked||r.bot||r.mit||(r.bks&&Object.keys(r.bks).length)||(r.ou&&Object.keys(r.ou).length);
-      if(!kept) delete rows[id];
-    });
-  });
+  // harsher: strip today too, shrink odds cache and wire to essentials
+  Object.keys(L.days).forEach(d=>stripDay(L.days[d].rows));
+  if(L.oddsCache){ delete L.oddsCache.ou; delete L.oddsCache.events; }
+  L.wire=(L.wire||[]).slice(-15);
+  L.mdays={};
 }
 async function saveLedger(L){
   foldOldDays(L);
@@ -150,7 +147,16 @@ async function saveCore(L){
   emergencyTrim(L); delete L.mut; delete L.mdays; body=JSON.stringify(L);
   console.log('trimmed blob:', (body.length/1024).toFixed(0),'KB');
   r=await fetch(`${JB}/${JSONBIN_BIN}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body});
-  console.log(r.ok?'retry save OK':'RETRY STILL FAILING HTTP '+r.status+' — the bin may be over its plan size limit');
+  if(r.ok){ console.log('retry save OK'); return; }
+  // final fallback: minimal core that at least preserves picks + the colony pointer
+  const minimal={days:{}, wire:[], oddsCache:{date:L.oddsCache?.date, prices:L.oddsCache?.prices||{}}, mutBinId:L.mutBinId, lastRun:L.lastRun};
+  const today=todayISO();
+  Object.keys(L.days).forEach(d=>{ minimal.days[d]={rows:{}}; Object.entries(L.days[d].rows).forEach(([id,row])=>{ minimal.days[d].rows[id]=row; }); });
+  Object.keys(minimal.days).forEach(d=>stripDay(minimal.days[d].rows));
+  const mb=JSON.stringify(minimal);
+  console.log('minimal core:',(mb.length/1024).toFixed(0),'KB');
+  const r3=await fetch(`${JB}/${JSONBIN_BIN}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body:mb});
+  console.log(r3.ok?'minimal core saved — colony pointer preserved':'ALL SAVES FAILING HTTP '+r3.status+' — paste this log to Claude');
 }
 function wire(L,who,text){ L.wire.push({t:Date.now(),who,text}); console.log(`[wire:${who}] ${text}`); }
 
@@ -822,4 +828,4 @@ const __main=(async()=>{ if(process.env.MUT_TEST==='1') return;
   console.log('run complete', new Date().toISOString());
 })();
 if(process.env.MUT_TEST!=='1') await __main;   // ensures the run completes before the process exits
-export {mutInit,mutantsPick,mutantsSettle,mutantsEvolve,activeMutants};
+export {mutInit,mutantsPick,mutantsSettle,mutantsEvolve,activeMutants,pruneLedger,emergencyTrim};
