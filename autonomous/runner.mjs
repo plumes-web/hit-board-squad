@@ -13,7 +13,7 @@
 // ============================================================================
 import process from 'node:process';
 
-const RUNNER_BUILD='2026-07-08.6';
+const RUNNER_BUILD='2026-07-08.7';
 const API='https://statsapi.mlb.com/api/v1';
 const JB='https://api.jsonbin.io/v3/b';
 const ENV=k=>process.env[k]||'';
@@ -450,6 +450,26 @@ async function scanNews(rows){
 
 // ---------- hits O/U engine (mirror of the dashboard) ----------
 function impliedPct(a){ return a==null?null:(a<0?-a/(-a+100)*100:100/(a+100)*100); }
+const PICK_WHY={
+  r5:r=>'composite '+(r.score??'—'),
+  mit:r=>{const m=mittsEval(r);return m.prob?m.prob.toFixed(0)+'% vs '+(r.dkImplied?.toFixed(0)??'—')+'% (+'+(m.edge?.toFixed(1)??'—')+'%)':'value';},
+  chalky:r=>'K '+(r.st?.k?.toFixed(1)??'low')+'% · hit '+r.l15HitG+'/'+r.l15GwAB,
+  gapper:r=>'xBA '+(r.st?.xba?.toFixed(3)??'—')+' · '+(r.st?.hh?.toFixed(0)??'—')+'% HH',
+  sal:r=>{const o=r.opp||{};const bS=o.hand==='L'?r.avgVsL:r.avgVsR;return (bS?.toFixed(3)??'—')+' vs '+o.hand+'HP';},
+  parkey:r=>'park '+(r.park?.pf??100)+' · '+(r.opp?.h9L5?.toFixed(1)??'—')+' H/9',
+  fadey:r=>(r.dkOdds>0?'+':'')+r.dkOdds+', +'+((r.estP-r.dkImplied)||0).toFixed(1)+'%',
+  streaks:r=>(r.streak??0)+'-game streak',
+  grinder:r=>'BvP '+r.bvpH+'-for-'+r.bvpAB,
+};
+function ouWhy(bid,r,side,c){
+  if(side!=='U') return (PICK_WHY[bid]||PICK_WHY.r5)(r);
+  const M={chalky:()=>'fade '+(r.st?.k?.toFixed(1)??'high')+'% K',gapper:()=>'fade xBA '+(r.st?.xba?.toFixed(3)??'—'),
+    sal:()=>{const o=r.opp||{};const bS=o.hand==='L'?r.avgVsL:r.avgVsR;return 'fade '+(bS?.toFixed(3)??'—')+' vs '+o.hand+'HP';},
+    parkey:()=>'pitcher park '+(r.park?.pf??100),fadey:()=>'+money under, +'+c.eU.toFixed(1)+'%',
+    streaks:()=>'cold '+((c.hitRate*100)|0)+'% hit-rate',grinder:()=>'BvP '+r.bvpH+'-for-'+r.bvpAB,
+    mit:()=>'U edge +'+c.eU.toFixed(1)+'%',r5:()=>'composite '+(r.score??'—')+' bottom tier'};
+  return (M[bid]||M.mit)();
+}
 function ouContext(r){
   if(r.ouLine==null||r.ouOver==null||r.ouUnder==null||r.estP==null) return null;
   const n=r.expAB||3.8, p=1-Math.pow(1-r.estP/100,1/n);
@@ -496,13 +516,16 @@ function fileOU(L,dt,rows,now,pitchTime){
       const c=ouContext(r); if(!c) continue;
       const a=aff(r,c); if(!a) continue;
       if(a.side==='O' && r.ouLine<1 && hasPick(L,dt,bid,r.id)) continue; // same bet as hit card
-      cands.push({r,side:a.side,line:r.ouLine,odds:a.side==='O'?r.ouOver:r.ouUnder,w:a.w});
+      cands.push({r,side:a.side,line:r.ouLine,odds:a.side==='O'?r.ouOver:r.ouUnder,w:a.w,why:ouWhy(bid,r,a.side,c)});
     }
-    cands.sort((a,b)=>b.w-a.w);
-    const picks=cands.slice(0,3);
+    const overs=cands.filter(x=>x.side==='O').sort((a,b)=>b.w-a.w);
+    const unders=cands.filter(x=>x.side==='U').sort((a,b)=>b.w-a.w);
+    let picks=[...overs.slice(0,2),...unders.slice(0,1)];
+    if(picks.length<3) picks=picks.concat((unders.length>1?unders.slice(1):overs.slice(2)).slice(0,3-picks.length));
+    picks=picks.slice(0,3);
     if(picks.length<3){ console.log(NAMES[bid]+' O/U: passes'); continue; }
     picks.forEach(p=>{ record(L,dt,p.r); const row=L.days[dt].rows[p.r.id];
-      row.ou=row.ou||{}; row.ou[bid]={side:p.side,line:p.line,odds:p.odds,res:null}; });
+      row.ou=row.ou||{}; row.ou[bid]={side:p.side,line:p.line,odds:p.odds,res:null,why:p.why||null}; });
     wire(L,bid,`${NAMES[bid]} O/U card: ${picks.map(p=>`${p.r.name} ${p.side}${p.line}`).join(', ')}`);
   }
 }
@@ -513,8 +536,9 @@ function record(L,dt,r){ const d=day(L,dt); const prev=d.rows[r.id]||{};
   d.rows[r.id]={id:r.id,n:r.name,t:r.team,g:r.game,rk:r.rank??prev.rk,gp:r.gamePk??prev.gp??null,
     sc:r.score,ep:r.estP!=null?Math.round(r.estP*10)/10:null,od:r.dkOdds??prev.od??null,op:r.opp?.name||'',
     picked:prev.picked||false,pickOdds:prev.pickOdds??null,bot:prev.bot||false,botOdds:prev.botOdds??null,
-    mit:prev.mit||false,mitOdds:prev.mitOdds??null,bks:prev.bks,ou:prev.ou,res:prev.res??null}; }
+    mit:prev.mit||false,mitOdds:prev.mitOdds??null,bks:prev.bks,ou:prev.ou,why:prev.why,res:prev.res??null}; }
 function setPick(L,dt,botId,r){ const d=day(L,dt); record(L,dt,r); const row=d.rows[r.id];
+  try{ row.why=row.why||{}; row.why[botId]=(PICK_WHY[botId]||PICK_WHY.r5)(r); }catch(e){}
   if(botId==='r5'){row.bot=true;row.botOdds=r.dkOdds??row.od??null;}
   else if(botId==='mit'){row.mit=true;row.mitOdds=r.dkOdds??row.od??null;}
   else{row.bks=row.bks||{};row.bks[botId]=r.dkOdds??row.od??null;} }
@@ -628,6 +652,12 @@ function mutInit(L){
 function mutAlert(L,k,msg){ L.mut.alerts.push({t:Date.now(),k,msg}); L.mut.alerts=L.mut.alerts.slice(-40); console.log('[mutant-alert:'+k+'] '+msg); }
 function activeMutants(L){ return Object.values(L.mut.roster).filter(m=>!m.absorbed); }
 
+function mutWhy(g,r){
+  const f=mutFeatures(r);
+  const top=GENE_KEYS.map(k=>[k,f[k]*g.w[k]]).sort((a,b)=>b[1]-a[1]).slice(0,2).map(x=>x[0]);
+  const V={form:('L15 '+(r.l15Avg?.toFixed(3)??'')),hr:('hit-rate '+((r.l15GwAB?r.l15HitG/r.l15GwAB*100:0)|0)+'%'),stk:(r.streak+'-gm streak'),k:('K '+(r.st?.k?.toFixed(0)??'?')+'%'),xba:('xBA '+(r.st?.xba?.toFixed(3)??'?')),hh:((r.st?.hh?.toFixed(0)??'?')+'% HH'),plat:'platoon edge',bvp:('BvP '+(r.bvpH??0)+'/'+(r.bvpAB??0)),park:('park '+(r.park?.pf??100)),h9:((r.opp?.h9L5?.toFixed(1)??'?')+' H/9'),edge:('edge '+(r.edge?.toFixed(1)??'?')+'%'),prob:('est '+(r.estP?.toFixed(0)??'?')+'%')};
+  return top.map(k=>V[k]).join(' · ');
+}
 function mutantsPick(L, date, rows, now, pitchTime){
   if(L._mutLoadFailed) return;
   mutInit(L);
@@ -649,19 +679,33 @@ function mutantsPick(L, date, rows, now, pitchTime){
       return hrOK&&kOK&&pOK&&(!g.f.conf||r.confirmed);
     });
     const scored=pool.map(r=>({r,sc:mutScore(g,r)})).sort((a,b)=>b.sc-a.sc);
+    // the anti-pool: players this mutant's own filters REJECTED — its fade material
+    const poolIds=new Set(pool.map(r=>r.id));
+    const fades=avail.filter(r=>!poolIds.has(r.id)&&r.ouLine!=null&&r.ouOver!=null&&r.ouUnder!=null)
+      .map(r=>({r,sc:mutScore(g,r)})).sort((a,b)=>a.sc-b.sc);   // worst first
+    const cap=Math.min(g.n,3);
+    // how many Under slots this genome wants: OU-heavy genomes fade more
+    const uSlots=g.bt.hit<=.33?2:g.bt.hit<.8?1:0;
     let placed=0;
-    for(const {r,sc} of scored){
-      if(placed>=Math.min(g.n,3)) break;
+    const place=(r,pk)=>{ const row=md.rows[r.id]=md.rows[r.id]||{n:r.name,t:r.team,op:r.opp?.name||'',od:r.dkOdds??null,ouL:r.ouLine??null,ouO:r.ouOver??null,ouU:r.ouUnder??null,res:null,mk:{}};
+      if(row.mk[m.id]) return false; row.mk[m.id]=pk; placed++; return true; };
+    for(const {r} of scored){
+      if(placed>=cap-Math.min(uSlots,fades.length?uSlots:0)) break;
       const wantHit=rng()<g.bt.hit;
-      const row=md.rows[r.id]=md.rows[r.id]||{n:r.name,t:r.team,op:r.opp?.name||'',od:r.dkOdds??null,ouL:r.ouLine??null,ouO:r.ouOver??null,ouU:r.ouUnder??null,res:null,mk:{}};
-      if(wantHit && r.dkOdds!=null && !row.mk[m.id]){
-        row.mk[m.id]=['H',null,r.dkOdds,null]; placed++;
-      } else if(r.ouLine!=null && r.ouOver!=null && r.ouUnder!=null && !row.mk[m.id]){
-        const side=sc>=g.ouHi?'O':sc<=g.ouLo?'U':null;
-        if(side==='O'&&r.ouLine<1&&row.mk[m.id]) continue;
-        if(side){ row.mk[m.id]=['OU',side,side==='O'?r.ouOver:r.ouUnder,r.ouLine]; placed++; }
-      }
+      if(wantHit && r.dkOdds!=null) place(r,['H',null,r.dkOdds,null,null,mutWhy(g,r)]);
+      else if(r.ouLine!=null&&r.ouOver!=null) place(r,['OU','O',r.ouOver,r.ouLine,null,mutWhy(g,r)]);
     }
+    for(const {r} of fades){
+      if(placed>=cap) break;
+      const hr=r.l15GwAB>0?r.l15HitG/r.l15GwAB:0; const fails=[];
+      if(hr<g.f.minHR) fails.push('hit-rate '+((hr*100)|0)+'%<'+((g.f.minHR*100)|0)+'%');
+      if((r.st?.k??24)>g.f.maxK) fails.push('K '+(r.st?.k?.toFixed(0)??'?')+'%>'+g.f.maxK.toFixed(0));
+      if((r.estP??0)<g.f.minProb) fails.push('est '+(r.estP?.toFixed(0)??'?')+'%<'+g.f.minProb.toFixed(0));
+      place(r,['OU','U',r.ouUnder,r.ouLine,null,'fade: '+(fails.join(', ')||'below my bar')]);
+    }
+    // top up with overs if fades were scarce
+    for(const {r} of scored){ if(placed>=cap) break;
+      if(r.ouLine!=null&&r.ouOver!=null) place(r,['OU','O',r.ouOver,r.ouLine,null,mutWhy(g,r)]); }
     if(placed) filed++;
   }
   md.filed=true;
@@ -731,6 +775,7 @@ function mutantsEvolve(L, dt){
     const mentor=top[Math.floor(rng()*top.length)];
     GENE_KEYS.forEach(k=>{ m.g.w[k]=Math.round((m.g.w[k]*.7+mentor.g.w[k]*.3+(rng()-.5)*.1)*100)/100; });
     if(rng()<.4) m.g.f.minHR=clamp(m.g.f.minHR+(rng()-.5)*.06,.3,.65);
+    if(rng()<.4) m.g.bt.hit=clamp(m.g.bt.hit*.7+mentor.g.bt.hit*.3+(rng()-.5)*.1,0,1);
     if(rng()<.4) m.g.f.minProb=clamp(m.g.f.minProb+(rng()-.5)*3,50,70);
     m.chgAt=dt; m.rec.cs=0;
     m.log.push({d:dt,note:`Studied ${mentor.name}'s approach (7-day ${uNum(fitness(mentor))}) and shifted 30% toward its weighting. New identity: ${describeGenome(m.g)}`});
