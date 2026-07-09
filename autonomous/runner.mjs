@@ -13,7 +13,7 @@
 // ============================================================================
 import process from 'node:process';
 
-const RUNNER_BUILD='2026-07-08.7';
+const RUNNER_BUILD='2026-07-09.1';
 const API='https://statsapi.mlb.com/api/v1';
 const JB='https://api.jsonbin.io/v3/b';
 const ENV=k=>process.env[k]||'';
@@ -551,7 +551,12 @@ function currentPicks(L,dt,botId){ const d=L.days[dt]; if(!d)return[];
 
 async function settle(L){
   const today=todayISO();
-  const dates=Object.keys(L.days).filter(dt=>dt<today&&Object.values(L.days[dt].rows).some(r=>r.res==null||r.res==='dnp')).sort().slice(-10);
+  // union: main-ledger pending dates PLUS colony days awaiting settlement —
+  // so the mutants always grade even if the dashboard settled the bots first
+  const dates=[...new Set([
+    ...Object.keys(L.days).filter(dt=>dt<today&&Object.values(L.days[dt].rows).some(r=>r.res==null||r.res==='dnp')),
+    ...Object.keys(L.mdays||{}).filter(dt=>dt<today&&!L.mdays[dt].settled)
+  ])].sort().slice(-10);
   for(const dt of dates){
     const hits={};
     for(let off=0;off<3000;off+=1000){
