@@ -13,7 +13,7 @@
 // ============================================================================
 import process from 'node:process';
 
-const RUNNER_BUILD='2026-07-09.1';
+const RUNNER_BUILD='2026-07-09.2';
 const API='https://statsapi.mlb.com/api/v1';
 const JB='https://api.jsonbin.io/v3/b';
 const ENV=k=>process.env[k]||'';
@@ -393,6 +393,69 @@ const STRATS=[
 ];
 const NAMES={r5:'Rusty',mit:'Mitts',chalky:'Chalky',gapper:'Gapper',sal:'Southpaw Sal',parkey:'Parkey',fadey:'Fadey',streaks:'Streaks',grinder:'The Grinder'};
 function top(rows,fn){ return rows.map(r=>({r,sc:fn(r)})).filter(x=>x.sc!=null).sort((a,b)=>b.sc-a.sc).slice(0,3).map(x=>x.r); }
+
+
+// ---------- STEAM: the Mitts × Fadey fusion book ----------
+function catWL(L,id,kind){
+  let w=0,l=0;
+  Object.values(L.days).forEach(d=>Object.values(d.rows).forEach(r=>{
+    if(kind==='hit'){
+      const has=id==='mit'?r.mit:(r.bks&&r.bks[id]!==undefined);
+      if(has&&(r.res==='win'||r.res==='loss')) r.res==='win'?w++:l++;
+    } else {
+      const e=r.ou&&r.ou[id];
+      if(e&&(e.res==='win'||e.res==='loss')) e.res==='win'?w++:l++;
+    }
+  }));
+  return (w+l)>0? w/(w+l) : null;
+}
+const bestOdds=(a,b)=> a==null?b : b==null?a : Math.max(a,b);
+function steamFile(L, date, pitchOK){
+  const d=L.days[date]; if(!d) return;
+  const hasSteamHit=Object.values(d.rows).some(r=>r.bks&&r.bks.steam!==undefined);
+  const hasSteamOU=Object.values(d.rows).some(r=>r.ou&&r.ou.steam);
+  if(!hasSteamHit){
+    const mitP=Object.values(d.rows).filter(r=>r.mit&&pitchOK(r.id));
+    const fadP=Object.values(d.rows).filter(r=>r.bks&&r.bks.fadey!==undefined&&pitchOK(r.id));
+    const fadIds=new Set(fadP.map(r=>r.id));
+    const inter=mitP.filter(r=>fadIds.has(r.id));
+    const mHot=(catWL(L,'mit','hit')??.5)>=(catWL(L,'fadey','hit')??.5);
+    const primary=mHot?mitP:fadP, hotName=mHot?'Mitts':'Fadey';
+    const chosen=[...inter];
+    for(const r of primary){ if(chosen.length>=3) break; if(!chosen.some(x=>x.id===r.id)) chosen.push(r); }
+    if(chosen.length){
+      chosen.slice(0,3).forEach(r=>{
+        r.bks=r.bks||{}; r.bks.steam=bestOdds(r.mitOdds, r.bks.fadey)??r.od??null;
+        r.why=r.why||{}; r.why.steam=inter.some(x=>x.id===r.id)?'both parents converged':'from '+hotName+' (better 1+hit win %)';
+      });
+      wire(L,'steam',`\u2668 Steam filed: ${chosen.slice(0,3).map(r=>r.n).join(', ')} (${inter.length} convergence pick${inter.length===1?'':'s'})`);
+    }
+  }
+  if(!hasSteamOU){
+    const ent=[];
+    Object.values(d.rows).forEach(r=>{
+      const m=r.ou?.mit, f=r.ou?.fadey;
+      if(m&&f&&m.side===f.side&&m.line===f.line) ent.push({r,e:m,src:'inter',odds:bestOdds(m.odds,f.odds)});
+    });
+    const oHot=(catWL(L,'mit','ou')??.5)>=(catWL(L,'fadey','ou')??.5);
+    const hotId=oHot?'mit':'fadey', hotName=oHot?'Mitts':'Fadey';
+    Object.values(d.rows).forEach(r=>{
+      const e=r.ou?.[hotId];
+      if(e&&!ent.some(x=>x.r.id===r.id)) ent.push({r,e,src:'hot',odds:e.odds});
+    });
+    let placed=0;
+    for(const {r,e,src,odds} of ent){
+      if(placed>=3) break;
+      if(!pitchOK(r.id)) continue;
+      const holdsHit=r.bks&&r.bks.steam!==undefined;
+      if(e.side==='O'&&e.line<1&&holdsHit) continue;
+      r.ou=r.ou||{};
+      r.ou.steam={side:e.side,line:e.line,odds:odds??null,res:null,why:src==='inter'?'both parents on the same side':'from '+hotName+' (better O/U win %)'};
+      placed++;
+    }
+    if(placed) wire(L,'steam',`\u2668 Steam O/U card: ${placed} pick(s)`);
+  }
+}
 
 // ---------- news wire ----------
 const RISK_WORDS=/(scratch|scratched|out of (the )?lineup|not in (the )?lineup|placed on (the )?(10|15|60)?-?\s?day il|to the il|injured list|day.to.day|left tonight|exit(ed|s)? (the )?game|benched|sitting|getting a day|precautionary|tightness|soreness|sore |strain|sprain|discomfort)/i;
@@ -872,10 +935,12 @@ const __main=(async()=>{ if(process.env.MUT_TEST==='1') return;
   }
   console.log('board:',rows.length,'hitters ·',rows.filter(r=>r.confirmed).length,'confirmed ·',rows.filter(r=>r.dkOdds!=null).length,'priced ·',signals.size,'news flags');
   fileOU(L, date, rows.filter(r=>!signals.has(r.id)), now, pitchTime);
+  const pitchById={}; rows.forEach(r=>pitchById[r.id]=pitchTime(r));
+  steamFile(L, date, id=>(pitchById[id]??Infinity)>now);
   mutantsPick(L, date, rows.filter(r=>!signals.has(r.id)), now, pitchTime);
   mutantsEvolve(L, daysAgo(date,1));
   await saveLedger(L);
   console.log('run complete', new Date().toISOString());
 })();
 if(process.env.MUT_TEST!=='1') await __main;   // ensures the run completes before the process exits
-export {mutInit,mutantsPick,mutantsSettle,mutantsEvolve,activeMutants,pruneLedger,emergencyTrim};
+export {steamFile,catWL,mutInit,mutantsPick,mutantsSettle,mutantsEvolve,activeMutants,pruneLedger,emergencyTrim};
