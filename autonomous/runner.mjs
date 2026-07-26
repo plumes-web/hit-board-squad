@@ -30,6 +30,15 @@ if (!JSONBIN_KEY || !JSONBIN_BIN) {
 
 const API = 'https://statsapi.mlb.com/api/v1';
 const JB  = 'https://api.jsonbin.io/v3/b';
+/* Records are stored gzip-compressed inside a JSON wrapper {v:1, z:"<base64>"}.
+   Ledger JSON is highly repetitive and compresses ~10:1, which keeps everything
+   comfortably inside jsonbin's free-plan 100KB record cap. Plain (uncompressed)
+   records are still read transparently for backward compatibility. */
+import { gzipSync, gunzipSync } from 'node:zlib';
+const packRec = rec => JSON.stringify({ v: 1, z: gzipSync(Buffer.from(JSON.stringify(rec))).toString('base64') });
+const unpackRec = raw => (raw && typeof raw.z === 'string')
+  ? JSON.parse(gunzipSync(Buffer.from(raw.z, 'base64')).toString('utf8'))
+  : raw;
 // jsonbin has two key types with different headers. Try the key as a Master Key
 // first; if jsonbin rejects a write/read with 401/403, retry it as an Access Key.
 const HDR_MASTER = { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY };
@@ -116,17 +125,17 @@ function parseCSV(text) {
 async function binRead(binId) {
   const r = await jbFetch(`${JB}/${binId}/latest`, {});
   if (!r.ok) throw new Error('jsonbin read ' + binId + ': HTTP ' + r.status + (r.status === 403 ? KEY_HELP : ''));
-  return (await r.json()).record;
+  return unpackRec((await r.json()).record);
 }
 async function binWrite(binId, record) {
-  const r = await jbFetch(`${JB}/${binId}`, { method: 'PUT', body: JSON.stringify(record) });
+  const r = await jbFetch(`${JB}/${binId}`, { method: 'PUT', body: packRec(record) });
   if (!r.ok) {
     let body = ''; try { body = (await r.text()).slice(0, 200); } catch {}
     throw new Error('jsonbin write ' + binId + ': HTTP ' + r.status + (body ? ' — ' + body : '') + (r.status === 403 ? KEY_HELP : ''));
   }
 }
-/* jsonbin free plan caps bins at ~100KB and answers oversized PUTs with 403.
-   writeFit measures the payload and applies shrink steps until it fits. */
+/* jsonbin free plan caps records at 100KB. With gzip we're normally far under it,
+   but writeFit still measures the *packed* payload and shrinks if ever needed. */
 const BIN_CAP = 95_000;
 function roundDeep(o) {
   if (Array.isArray(o)) return o.map(roundDeep);
@@ -136,24 +145,24 @@ function roundDeep(o) {
 }
 async function writeFit(binId, record, label, steps) {
   record = roundDeep(record);
-  let body = JSON.stringify(record);
+  let body = packRec(record);
   for (const [name, fn] of steps) {
     if (body.length <= BIN_CAP) break;
     fn(record);
     record = roundDeep(record);
-    body = JSON.stringify(record);
-    log('✂', label, 'over the free-plan bin cap — applied:', name, '→', (body.length / 1024).toFixed(0) + 'KB');
+    body = packRec(record);
+    log('✂', label, 'over the free-plan record cap — applied:', name, '→', (body.length / 1024).toFixed(0) + 'KB packed');
   }
-  if (body.length > BIN_CAP) log('⚠', label, 'still', (body.length / 1024).toFixed(0) + 'KB after trimming — jsonbin may reject it (free plan caps bins at ~100KB; a paid plan lifts this).');
+  if (body.length > BIN_CAP) log('⚠', label, 'still', (body.length / 1024).toFixed(0) + 'KB packed after trimming — jsonbin may reject it.');
   const r = await jbFetch(`${JB}/${binId}`, { method: 'PUT', body });
   if (!r.ok) {
     let msg = ''; try { msg = (await r.text()).slice(0, 200); } catch {}
-    throw new Error('jsonbin write ' + binId + ' (' + label + ', ' + (body.length / 1024).toFixed(0) + 'KB): HTTP ' + r.status + (msg ? ' — ' + msg : ''));
+    throw new Error('jsonbin write ' + binId + ' (' + label + ', ' + (body.length / 1024).toFixed(0) + 'KB packed): HTTP ' + r.status + (msg ? ' — ' + msg : ''));
   }
-  log(label, 'saved (' + (body.length / 1024).toFixed(0) + 'KB)');
+  log(label, 'saved (' + (body.length / 1024).toFixed(0) + 'KB packed)');
 }
 async function binCreate(name, record) {
-  const r = await jbFetch(JB, { method: 'POST', extra: { 'X-Bin-Name': name, 'X-Bin-Private': 'true' }, body: JSON.stringify(record) });
+  const r = await jbFetch(JB, { method: 'POST', extra: { 'X-Bin-Name': name, 'X-Bin-Private': 'true' }, body: packRec(record) });
   if (!r.ok) throw new Error('jsonbin create: HTTP ' + r.status + (r.status === 403 ? KEY_HELP : ''));
   return (await r.json()).metadata.id;
 }
