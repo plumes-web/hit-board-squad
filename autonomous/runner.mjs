@@ -1,946 +1,1265 @@
-// ============================================================================
-// HIT BOARD — AUTONOMOUS SQUAD RUNNER  (runs on GitHub Actions cron, no human)
-// Pipeline each run:
-//   1. Pull today's slate: schedule, probables, posted lineups (MLB Stats API)
-//   2. Build the board: point-in-time batter/pitcher profiles, Savant Statcast,
-//      park factors, DraftKings prices via The Odds API
-//   3. Scan the wire: Reddit + MLB/ESPN/RotoWire feeds + Bluesky for injury /
-//      scratch / lineup news (keyword engine; optional Claude for comprehension)
-//   4. Each bot files or REVISES its card — revisions allowed until that game's
-//      first pitch, every change logged to the wire with a reason
-//   5. Settle finished days from official stats
-//   6. Merge + write the ledger to jsonbin (same bin the dashboard syncs)
-// ============================================================================
-import process from 'node:process';
+/* ============================================================================
+   HIT BOARD — AUTONOMOUS SQUAD RUNNER  (autonomous/runner.mjs)
+   Runs on GitHub Actions every 30 min (see .github/workflows/squad.yml).
 
-const RUNNER_BUILD='2026-07-09.2';
-const API='https://statsapi.mlb.com/api/v1';
-const JB='https://api.jsonbin.io/v3/b';
-const ENV=k=>process.env[k]||'';
-const JSONBIN_KEY=ENV('JSONBIN_KEY'), JSONBIN_BIN=ENV('JSONBIN_BIN');
-const ODDS_KEY=ENV('ODDS_API_KEY'), ANTHROPIC_KEY=ENV('ANTHROPIC_API_KEY');
-if(!JSONBIN_KEY||!JSONBIN_BIN){ console.error('Missing JSONBIN_KEY / JSONBIN_BIN secrets'); process.exit(1); }
+   Each run:
+     1. Settles yesterday's (and missed) results from official stat lines
+     2. Rebuilds/refreshes today's board (MLB StatsAPI + Savant + Odds API)
+     3. Scans the wire (Reddit / news RSS / Bluesky) for scratches & IL moves
+     4. Files every bot's hit card + O/U card server-side, revises pre-pitch
+        — incl. the BETTER-PRICE RULE: any bot's 1+hit pick is upgraded to the
+          hits O/U Over when that market pays better for the same outcome
+     5. Runs the 100-mutant colony: daily picks, settlement, evolution
+     6. Writes everything to jsonbin MERGE-SAFELY (never clobbers fields)
 
-const PARK_FACTORS={COL:112,BOS:107,KC:104,ATH:104,CIN:103,ARI:102,WSH:102,MIN:101,PIT:101,LAA:101,TEX:100,ATL:100,PHI:100,DET:100,CWS:100,CHC:99,STL:99,MIL:99,HOU:99,LAD:99,MIA:99,TOR:99,CLE:98,BAL:98,TB:98,NYY:97,NYM:97,SF:97,SD:97,SEA:94};
-const num=v=>{const n=parseFloat(v);return isNaN(n)?null:n;};
-const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
-const scale=(v,lo,hi)=>v==null?null:clamp((v-lo)/(hi-lo)*100,0,100);
-const todayISO=()=>new Date().toLocaleDateString('en-CA',{timeZone:'America/New_York'});
-const daysAgo=(iso,n)=>{const d=new Date(iso+'T12:00:00Z');d.setUTCDate(d.getUTCDate()-n);return d.toISOString().slice(0,10);};
-const ipF=ip=>{if(ip==null)return 0;const[w,f]=String(ip).split('.');return(+w||0)+(f==='1'?1/3:f==='2'?2/3:0);};
-const normName=s=>String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/\b(jr|sr|ii|iii|iv)\b\.?/g,'').replace(/[^a-z ]/g,'').replace(/\s+/g,' ').trim();
-const lastName=s=>s.split(' ').slice(-1)[0];
+   Env (GitHub secrets): JSONBIN_KEY, JSONBIN_BIN, ODDS_API_KEY (optional but
+   strongly recommended), ANTHROPIC_API_KEY (optional news-confirm pass).
+   Node >= 20 (built-in fetch). Zero dependencies.
+   ========================================================================== */
 
-async function J(url,opts,tries=3){
-  for(let i=0;i<tries;i++){
-    try{ const r=await fetch(url,opts); if(!r.ok) throw new Error('HTTP '+r.status); return await r.json(); }
-    catch(e){ if(i===tries-1){ console.log('fetch fail',url.split('?')[0],e.message); return null; } await new Promise(r=>setTimeout(r,600*(i+1))); }
+const JSONBIN_KEY = (process.env.JSONBIN_KEY || '').trim();
+const JSONBIN_BIN = (process.env.JSONBIN_BIN || '').trim();
+const ODDS_KEY    = (process.env.ODDS_API_KEY || '').trim();
+const ANTH_KEY    = (process.env.ANTHROPIC_API_KEY || '').trim();
+
+if (!JSONBIN_KEY || !JSONBIN_BIN) {
+  console.error('FATAL: JSONBIN_KEY and JSONBIN_BIN secrets are required. ' +
+    'Repo → Settings → Secrets and variables → Actions.');
+  process.exit(1);
+}
+
+const API = 'https://statsapi.mlb.com/api/v1';
+const JB  = 'https://api.jsonbin.io/v3/b';
+const HDR = { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY };
+
+/* ---------------- small utils (mirrors of the dashboard's helpers) -------- */
+const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+const num = v => { const n = parseFloat(v); return isNaN(n) ? null : n; };
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const scale = (v, lo, hi) => v == null ? null : clamp((v - lo) / (hi - lo) * 100, 0, 100);
+const todayISO = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+const nowET = () => new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+const daysAgoISO = (iso, n) => { const d = new Date(iso + 'T12:00:00'); d.setDate(d.getDate() - n); return d.toISOString().slice(0, 10); };
+const fmtOdds = a => a == null ? '—' : (a > 0 ? '+' + a : String(a));
+const fmtAvg = a => (a == null || isNaN(a)) ? '—' : a.toFixed(3).replace(/^0/, '');
+const impliedPct = a => (a == null || isNaN(a)) ? null : (a < 0 ? (-a) / (-a + 100) * 100 : 100 / (a + 100) * 100);
+const normName = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  .toLowerCase().replace(/\b(jr|sr|ii|iii|iv)\b\.?/g, '').replace(/[^a-z ]/g, '').replace(/\s+/g, ' ').trim();
+const unitsFor = (res, od) => {
+  if (res == null || res === 'dnp') return 0;
+  if (res === 'loss') return -1;
+  if (od == null) return 0.4;
+  return od > 0 ? od / 100 : 100 / (-od);
+};
+
+async function getJSON(url, tries = 3, headers = {}) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url, { headers: { 'User-Agent': 'hit-board-runner/1.0', ...headers } });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.json();
+    } catch (e) {
+      if (i === tries - 1) { log('✗', url.split('?')[0], '—', e.message); return null; }
+      await new Promise(res => setTimeout(res, 500 * (i + 1)));
+    }
   }
 }
-async function T(url,opts){ try{ const r=await fetch(url,opts); return r.ok?await r.text():null; }catch(e){ return null; } }
-async function pool(tasks,limit){ let i=0; const out=new Array(tasks.length);
-  await Promise.all(Array.from({length:Math.min(limit,tasks.length)},async()=>{ while(i<tasks.length){const k=i++; out[k]=await tasks[k]();}})); return out; }
-
-function parseCSV(text){ const rows=[];let row=[],cur='',q=false;
-  for(const ch of text){ if(q){ if(ch==='"')q=false; else cur+=ch; } else if(ch==='"')q=true;
-    else if(ch===','){row.push(cur);cur='';} else if(ch==='\n'){row.push(cur.replace(/\r$/,''));rows.push(row);row=[];cur='';} else cur+=ch; }
-  if(cur||row.length){row.push(cur);rows.push(row);}
-  const head=rows[0]||[]; return rows.slice(1).map(r=>Object.fromEntries(head.map((h,i)=>[h.trim(),r[i]])));
-}
-
-// ---------- ledger I/O (jsonbin) ----------
-async function loadLedger(){
-  const d=await J(`${JB}/${JSONBIN_BIN}/latest`,{headers:{'X-Master-Key':JSONBIN_KEY}});
-  const rec=d?.record||{}; const L={...rec, days:rec.days||{}, wire:rec.wire||[]};
-  if(L.mutBinId){
-    const m=await J(`${JB}/${L.mutBinId}/latest`,{headers:{'X-Master-Key':JSONBIN_KEY}});
-    if(m?.record){ L.mut=m.record.mut||L.mut; L.mdays=m.record.mdays||L.mdays; }
-    else { L._mutLoadFailed=true; console.log('WARNING: colony bin unreachable — freezing all mutant ops this run so the colony cannot be overwritten'); }
+async function getText(url, tries = 2) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url, { headers: { 'User-Agent': 'hit-board-runner/1.0' } });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.text();
+    } catch (e) { if (i === tries - 1) return null; await new Promise(res => setTimeout(res, 500)); }
   }
-  return L;
 }
-async function ensureMutBin(L){
-  if(L.mutBinId) return;
-  const r=await fetch(`${JB}`,{method:'POST',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY,'X-Bin-Private':'true','X-Bin-Name':'hit-board-mutants'},body:JSON.stringify({mut:L.mut||null,mdays:L.mdays||{}})});
-  if(r.ok){ const d=await r.json(); L.mutBinId=d?.metadata?.id||null; console.log('created mutant bin:',L.mutBinId); }
-  else console.log('mutant bin creation failed HTTP',r.status);
+async function pool(tasks, limit) {
+  const q = [...tasks]; const workers = [];
+  for (let i = 0; i < limit; i++) workers.push((async () => { while (q.length) { const t = q.shift(); try { await t(); } catch (e) { log('task err:', e.message); } } })());
+  await Promise.all(workers);
 }
-function foldOldDays(L){
-  // roll settled days older than 7d into compact season aggregates, then prune detail
-  L.agg=L.agg||{books:{},series:{},folded:{}};
-  const cutoff=daysAgo(todayISO(),7), hardCut=daysAgo(todayISO(),25);
-  const BOOK_IDS=['you','r5','mit','chalky','gapper','sal','parkey','fadey','streaks','grinder'];
-  const flag={you:r=>r.picked,r5:r=>r.bot,mit:r=>r.mit};
-  const oddsOf={you:r=>r.pickOdds??r.od,r5:r=>r.botOdds??r.od,mit:r=>r.mitOdds??r.od};
-  Object.keys(L.days).sort().forEach(dt=>{
-    if(dt>=cutoff||L.agg.folded[dt]) return;
-    const rows=Object.values(L.days[dt].rows);
-    if(rows.some(r=>r.res==null&&(r.picked||r.bot||r.mit||(r.bks&&Object.keys(r.bks).length)))) return; // not fully settled
-    const dayU={};
-    rows.forEach(r=>{
-      BOOK_IDS.forEach(b=>{
-        const has=flag[b]?flag[b](r):!!(r.bks&&r.bks[b]!==undefined);
-        if(has&&(r.res==='win'||r.res==='loss')){
-          const od=oddsOf[b]?oddsOf[b](r):r.bks[b]??r.od;
-          const u=r.res==='win'?(od!=null?(od>0?od/100:100/-od):0.4):-1;
-          const A=L.agg.books[b]=L.agg.books[b]||{w:0,l:0,u:0,ow:0,ol:0,ouU:0,dnp:0};
-          if(r.res==='win')A.w++; else A.l++; A.u+=u; dayU[b]=(dayU[b]||0)+u;
-        }
-        if(has&&r.res==='dnp'){ const A=L.agg.books[b]=L.agg.books[b]||{w:0,l:0,u:0,ow:0,ol:0,ouU:0,dnp:0}; A.dnp++; }
+function parseCSV(text) {
+  const rows = []; let row = [], field = '', inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQ) { if (ch === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false; } else field += ch; }
+    else if (ch === '"') inQ = true;
+    else if (ch === ',') { row.push(field); field = ''; }
+    else if (ch === '\n') { row.push(field); field = ''; if (row.length > 1 || row[0] !== '') rows.push(row); row = []; }
+    else if (ch !== '\r') field += ch;
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  if (!rows.length) return [];
+  const head = rows[0];
+  return rows.slice(1).map(r => { const o = {}; head.forEach((h, i) => o[h.trim()] = r[i]); return o; });
+}
+
+/* ---------------- jsonbin: merge-safe read / write ------------------------ */
+async function binRead(binId) {
+  const r = await fetch(`${JB}/${binId}/latest`, { headers: HDR });
+  if (!r.ok) throw new Error('jsonbin read ' + binId + ': HTTP ' + r.status);
+  return (await r.json()).record;
+}
+async function binWrite(binId, record) {
+  const r = await fetch(`${JB}/${binId}`, { method: 'PUT', headers: HDR, body: JSON.stringify(record) });
+  if (!r.ok) throw new Error('jsonbin write ' + binId + ': HTTP ' + r.status);
+}
+async function binCreate(name, record) {
+  const r = await fetch(JB, { method: 'POST', headers: { ...HDR, 'X-Bin-Name': name, 'X-Bin-Private': 'true' }, body: JSON.stringify(record) });
+  if (!r.ok) throw new Error('jsonbin create: HTTP ' + r.status);
+  return (await r.json()).metadata.id;
+}
+/* deep-merge one ledger row: dashboard edits and runner edits both survive */
+function mergeRow(remote, local) {
+  const out = { ...remote, ...local };
+  out.bks = { ...(remote?.bks || {}), ...(local?.bks || {}) };
+  out.ou  = { ...(remote?.ou  || {}), ...(local?.ou  || {}) };
+  out.why = { ...(remote?.why || {}), ...(local?.why || {}) };
+  if (!Object.keys(out.bks).length) delete out.bks;
+  if (!Object.keys(out.ou).length)  delete out.ou;
+  if (!Object.keys(out.why).length) delete out.why;
+  // settled results are final — prefer whichever side has a terminal grade
+  const term = v => v === 'win' || v === 'loss';
+  // the user's checkbox lives on the dashboard; the runner never writes it,
+  // so the remote (dashboard-synced) value always wins on the runner side
+  out.picked = remote?.picked ?? local?.picked ?? false;
+  out.pickOdds = remote?.pickOdds ?? local?.pickOdds ?? null;
+  out.res = term(local?.res) ? local.res : term(remote?.res) ? remote.res : (local?.res ?? remote?.res ?? null);
+  return out;
+}
+function mergeDays(remoteDays = {}, localDays = {}) {
+  const out = {};
+  const dates = new Set([...Object.keys(remoteDays), ...Object.keys(localDays)]);
+  for (const dt of dates) {
+    const rd = remoteDays[dt]?.rows || {}, ld = localDays[dt]?.rows || {};
+    const rows = {};
+    for (const id of new Set([...Object.keys(rd), ...Object.keys(ld)]))
+      rows[id] = mergeRow(rd[id], ld[id]);
+    out[dt] = { rows };
+  }
+  return out;
+}
+
+/* ---------------- park factors ------------------------------------------- */
+const PARK_FACTORS = {
+  COL: 112, BOS: 107, KC: 104, ATH: 104, CIN: 103, ARI: 102, WSH: 102,
+  MIN: 101, PIT: 101, LAA: 101, TEX: 100, ATL: 100, PHI: 100, DET: 100, CWS: 100,
+  CHC: 99, STL: 99, MIL: 99, HOU: 99, LAD: 99, MIA: 99, TOR: 99,
+  CLE: 98, BAL: 98, TB: 98, NYY: 97, NYM: 97, SF: 97, SD: 97, SEA: 94
+};
+const WEIGHTS = { form: 0.35, bvp: 0.25, pitcher: 0.25, platoon: 0.15 };
+const FORM_DAYS = 21, FORM_GAMES = 15, BVP_FULL_PA = 18, EXP_AB = 3.8, DEPTH = 110;
+
+/* ============================================================================
+   1. SETTLEMENT — identical grading semantics to the dashboard
+   ========================================================================== */
+async function hitsForDate(dt) {
+  const season = dt.slice(0, 4); const hitsById = {};
+  for (let off = 0; off < 3000; off += 1000) {
+    const d = await getJSON(`${API}/stats?stats=byDateRange&group=hitting&season=${season}&startDate=${dt}&endDate=${dt}&playerPool=ALL&limit=1000&offset=${off}`);
+    const s = d?.stats?.[0]?.splits || [];
+    s.forEach(sp => { if (sp.player && (sp.stat.plateAppearances || 0) > 0) hitsById[sp.player.id] = (hitsById[sp.player.id] || 0) + (sp.stat.hits || 0); });
+    if (s.length < 1000) break;
+  }
+  if (Object.keys(hitsById).length < 20) {
+    log('bulk stats thin for', dt, '— grading from box scores…');
+    const sched = await getJSON(`${API}/schedule?sportId=1&date=${dt}`);
+    const games = (sched?.dates?.[0]?.games || []).filter(g => g.status?.abstractGameState === 'Final');
+    await pool(games.map(g => async () => {
+      const box = await getJSON(`${API}/game/${g.gamePk}/boxscore`);
+      ['home', 'away'].forEach(side => {
+        Object.values(box?.teams?.[side]?.players || {}).forEach(p => {
+          const b = p?.stats?.batting;
+          if (b && (b.plateAppearances || 0) > 0)
+            hitsById[p.person.id] = (hitsById[p.person.id] || 0) + (b.hits || 0);
+        });
       });
-      if(r.ou) Object.entries(r.ou).forEach(([b,e])=>{
-        if(e.res!=='win'&&e.res!=='loss') return;
-        const A=L.agg.books[b]=L.agg.books[b]||{w:0,l:0,u:0,ow:0,ol:0,ouU:0,dnp:0};
-        const u=e.res==='win'?(e.odds!=null?(e.odds>0?e.odds/100:100/-e.odds):0.4):-1;
-        if(e.res==='win')A.ow++; else A.ol++; A.ouU+=u; dayU[b]=(dayU[b]||0)+u;
+    }), 5);
+  }
+  return hitsById;
+}
+function applyResults(day, hitsById) {
+  let n = 0;
+  Object.values(day.rows).forEach(r => {
+    if (r.res === 'win' || r.res === 'loss') { /* final */ }
+    else {
+      const h = hitsById[r.id];
+      if (h == null) { if (r.res == null) { r.res = 'dnp'; n++; } }
+      else { const nr = h >= 1 ? 'win' : 'loss'; if (r.res !== nr) { r.res = nr; n++; } }
+    }
+    if (r.ou) {
+      const h = hitsById[r.id];
+      Object.values(r.ou).forEach(e => {
+        if (e.res === 'win' || e.res === 'loss') return;
+        if (h == null) { e.res = 'dnp'; return; }
+        e.res = (e.side === 'O' ? h > e.line : h < e.line) ? 'win' : 'loss'; n++;
       });
+    }
+  });
+  return n;
+}
+async function settle(core, hitsCache) {
+  const today = todayISO(); const recheck = daysAgoISO(today, 10);
+  const dates = Object.keys(core.days || {}).filter(dt =>
+    dt < today && Object.values(core.days[dt].rows).some(r =>
+      r.res == null || (r.res === 'dnp' && dt >= recheck) ||
+      (r.ou && Object.values(r.ou).some(e => e.res == null)))).sort();
+  for (const dt of dates) {
+    const hitsById = hitsCache[dt] || (hitsCache[dt] = await hitsForDate(dt));
+    if (Object.keys(hitsById).length < 20) { log('⚠ no results for', dt, '— left as-is'); continue; }
+    const n = applyResults(core.days[dt], hitsById);
+    if (n) log('settled', n, 'entries for', dt);
+  }
+}
+
+/* ============================================================================
+   2. BOARD BUILD — full port of loadSlate() (spin analysis skipped, per docs)
+   ========================================================================== */
+async function fetchSavant(core, date) {
+  const season = date.slice(0, 4);
+  if (core.statCache?.date === date && core.statCache.bat && core.statCache.pit) return core.statCache;
+  const bat = {}, pit = {};
+  const bUrl = `https://baseballsavant.mlb.com/leaderboard/custom?year=${season}&type=batter&filter=&min=10&selections=xba,k_percent,whiff_percent,hard_hit_percent,exit_velocity_avg,sweet_spot_percent&chart=false&x=xba&y=xba&r=no&chartType=beeswarm&csv=true`;
+  const bt = await getText(bUrl);
+  if (bt && !bt.trim().startsWith('<')) parseCSV(bt).forEach(r => {
+    const id = parseInt(r.player_id, 10); if (!id) return;
+    bat[id] = { xba: num(r.xba), k: num(r.k_percent), whiff: num(r.whiff_percent), hh: num(r.hard_hit_percent), ev: num(r.exit_velocity_avg), ss: num(r.sweet_spot_percent) };
+  });
+  for (const sel of ['xba,exit_velocity_avg,barrel_batted_rate,hard_hit_percent,whiff_percent,k_percent,iz_contact_percent,linedrives_percent',
+                     'xba,exit_velocity_avg,barrel_batted_rate,hard_hit_percent,whiff_percent,k_percent']) {
+    const t = await getText(`https://baseballsavant.mlb.com/leaderboard/custom?year=${season}&type=pitcher&filter=&min=1&selections=${sel}&chart=false&x=xba&y=xba&r=no&chartType=beeswarm&csv=true`);
+    if (!t || t.trim().startsWith('<')) continue;
+    const parsed = parseCSV(t); if (!parsed.length || parsed[0].player_id === undefined) continue;
+    parsed.forEach(r => {
+      const id = parseInt(r.player_id, 10); if (!id) return;
+      pit[id] = { xba: num(r.xba), ev: num(r.exit_velocity_avg), barrel: num(r.barrel_batted_rate), hardhit: num(r.hard_hit_percent), whiff: num(r.whiff_percent), kpct: num(r.k_percent), izcontact: num(r.iz_contact_percent), ld: num(r.linedrives_percent) };
     });
-    Object.entries(dayU).forEach(([b,u])=>{ (L.agg.series[b]=L.agg.series[b]||[]).push({d:dt,u:Math.round(u*100)/100}); L.agg.series[b]=L.agg.series[b].slice(-120); });
-    L.agg.folded[dt]=true;
-  });
-  Object.keys(L.days).filter(d=>d<hardCut&&L.agg.folded[d]).forEach(d=>delete L.days[d]);
-}
-function stripDay(rows){
-  Object.keys(rows).forEach(id=>{ const r=rows[id];
-    const kept=r.picked||r.bot||r.mit||(r.bks&&Object.keys(r.bks).length)||(r.ou&&Object.keys(r.ou).length);
-    if(!kept) delete rows[id];
-  });
-}
-function pruneLedger(L){
-  // core diet: TODAY keeps the full board (live tracker / cards need it);
-  // every past day keeps only rows somebody actually bet on
-  const today=todayISO();
-  Object.keys(L.days).forEach(d=>{ if(d<today) stripDay(L.days[d].rows); });
-  if(L.mut) Object.values(L.mut.roster).forEach(m=>{ m.log=(m.log||[]).slice(-2); m.rec.hist=(m.rec.hist||[]).slice(-10); });
-  if(L.mdays) Object.keys(L.mdays).sort().slice(0,-3).forEach(d=>delete L.mdays[d]);
-  L.wire=(L.wire||[]).slice(-60);
-}
-function emergencyTrim(L){
-  // harsher: strip today too, shrink odds cache and wire to essentials
-  Object.keys(L.days).forEach(d=>stripDay(L.days[d].rows));
-  if(L.oddsCache){ delete L.oddsCache.ou; delete L.oddsCache.events; }
-  L.wire=(L.wire||[]).slice(-15);
-  L.mdays={};
-}
-async function saveLedger(L){
-  foldOldDays(L);
-  pruneLedger(L);
-  await ensureMutBin(L);
-  // colony lives in its own bin — split before sizing
-  const M={mut:L.mut||null, mdays:L.mdays||{}};
-  const core={...L};
-  if(L.mutBinId){ delete core.mut; delete core.mdays; }   // no bin yet? colony rides in the core rather than vanishing
-  if(L.mutBinId && !L._mutLoadFailed){
-    const mb=JSON.stringify(M);
-    const rm=await fetch(`${JB}/${L.mutBinId}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body:mb});
-    console.log('mutant bin:',(mb.length/1024).toFixed(0),'KB —',rm.ok?'saved OK':'SAVE FAILED HTTP '+rm.status);
+    break;
   }
-  return saveCore(core);
+  log('Savant:', Object.keys(bat).length, 'batters,', Object.keys(pit).length, 'pitchers (cached for the day)');
+  core.statCache = { date, bat, pit };
+  return core.statCache;
 }
-async function saveCore(L){
-  L.wire=L.wire.slice(-100); L.lastRun=new Date().toISOString();
-  let body=JSON.stringify(L);
-  console.log('ledger blob:', (body.length/1024).toFixed(0),'KB');
-  let r=await fetch(`${JB}/${JSONBIN_BIN}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body});
-  if(r.ok){ console.log('ledger saved OK'); return; }
-  console.log('CORE SAVE FAILED HTTP',r.status,'— emergency trim & retry');
-  emergencyTrim(L); delete L.mut; delete L.mdays; body=JSON.stringify(L);
-  console.log('trimmed blob:', (body.length/1024).toFixed(0),'KB');
-  r=await fetch(`${JB}/${JSONBIN_BIN}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body});
-  if(r.ok){ console.log('retry save OK'); return; }
-  // final fallback: minimal core that at least preserves picks + the colony pointer
-  const minimal={days:{}, wire:[], oddsCache:{date:L.oddsCache?.date, prices:L.oddsCache?.prices||{}}, mutBinId:L.mutBinId, lastRun:L.lastRun};
-  const today=todayISO();
-  Object.keys(L.days).forEach(d=>{ minimal.days[d]={rows:{}}; Object.entries(L.days[d].rows).forEach(([id,row])=>{ minimal.days[d].rows[id]=row; }); });
-  Object.keys(minimal.days).forEach(d=>stripDay(minimal.days[d].rows));
-  const mb=JSON.stringify(minimal);
-  console.log('minimal core:',(mb.length/1024).toFixed(0),'KB');
-  const r3=await fetch(`${JB}/${JSONBIN_BIN}`,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body:mb});
-  console.log(r3.ok?'minimal core saved — colony pointer preserved':'ALL SAVES FAILING HTTP '+r3.status+' — paste this log to Claude');
-}
-function wire(L,who,text){ L.wire.push({t:Date.now(),who,text}); console.log(`[wire:${who}] ${text}`); }
 
-// ---------- board build ----------
-async function buildBoard(date, L){
-  const season=date.slice(0,4);
-  const [sched,teams]=await Promise.all([
-    J(`${API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher,lineups`),
-    J(`${API}/teams?sportId=1&season=${season}`)]);
-  const abbr={};(teams?.teams||[]).forEach(t=>abbr[t.id]=t.abbreviation||t.name);
-  const games=sched?.dates?.[0]?.games||[];
-  console.log('schedule:',games.length,'game(s) for',date, sched?'':'(schedule fetch FAILED)');
-  if(!games.length) return null;
-  const ctx={},lineupOrder={},firstPitch={};
-  for(const g of games){
-    const label=`${abbr[g.teams.away.team.id]} @ ${abbr[g.teams.home.team.id]}`;
-    const park={name:g.venue?.name||'',pf:PARK_FACTORS[abbr[g.teams.home.team.id]]??100};
-    for(const side of['home','away']){
-      const t=g.teams[side].team.id, opp=g.teams[side==='home'?'away':'home'].probablePitcher||null;
-      ctx[t]={opp,label,gamePk:g.gamePk,park}; firstPitch[t]=g.gameDate;
-      (g.lineups?.[side+'Players']||[]).forEach((p,i)=>lineupOrder[p.id]=i+1);
+function scoreRow(c) {
+  let form = null;
+  if (c.l15GwAB >= 5) {
+    const hitRate = c.l15HitG / c.l15GwAB;
+    form = clamp(0.50 * (scale(c.l15Avg, .180, .340) ?? 40) + 0.20 * (scale(c.seasonAvg, .180, .340) ?? 40) + 30 * hitRate + Math.min(c.streak * 2, 12) - 6, 0, 100);
+  }
+  let bvp = null, bvpConf = 0;
+  if (c.bvpAB >= 4 && c.bvpAvg != null) { bvp = scale(c.bvpAvg, .150, .400); bvpConf = clamp(c.bvpPA / BVP_FULL_PA, 0, 1); }
+  let pit = null; const o = c.opp;
+  if (o) {
+    const parts = []; const add = (v, w) => { if (v != null) parts.push([v, w]); };
+    add(scale(o.xba, .225, .295), .22);
+    add(o.babip != null ? scale(o.babip, .250, .345) : null, .12);
+    add(o.kpct != null ? 100 - scale(o.kpct, 14, 32) : null, .14);
+    add(o.whiff != null ? 100 - scale(o.whiff, 18, 32) : null, .10);
+    add(o.izcontact != null ? scale(o.izcontact, 78, 90) : null, .05);
+    add(o.ld != null ? scale(o.ld, 18, 30) : null, .07);
+    add(scale(o.hardhit, 30, 48), .10);
+    add(scale(o.ev, 86.5, 91.5), .06);
+    add(scale(o.barrel, 4, 12), .08);
+    if (o.h9L5 != null && o.ipL5 >= 8) add(scale(o.h9L5, 6.5, 12.5), .12);
+    add(scale(o.baa, .200, .310), .06);
+    if (parts.length) { const w = parts.reduce((s, p) => s + p[1], 0); pit = parts.reduce((s, p) => s + p[0] * p[1], 0) / w; }
+  }
+  let plat = null;
+  if (o && o.hand !== '?') {
+    const bAvg = o.hand === 'L' ? c.avgVsL : c.avgVsR;
+    const side = c.bats === 'S' ? (o.hand === 'L' ? 'R' : 'L') : c.bats;
+    const pBaa = side === 'L' ? o.baaVsL : side === 'R' ? o.baaVsR : null;
+    const parts = [];
+    if (bAvg != null) parts.push(scale(bAvg, .180, .340));
+    if (pBaa != null) parts.push(scale(pBaa, .200, .320));
+    if (parts.length) plat = parts.reduce((a, b) => a + b, 0) / parts.length;
+  }
+  const terms = [];
+  if (form != null) terms.push([form, WEIGHTS.form]);
+  if (bvp != null) terms.push([bvp, WEIGHTS.bvp * bvpConf]);
+  if (pit != null) terms.push([pit, WEIGHTS.pitcher]);
+  if (plat != null) terms.push([plat, WEIGHTS.platoon]);
+  const wsum = terms.reduce((s, t) => s + t[1], 0);
+  c.fForm = form; c.fBvp = bvp; c.fPit = pit; c.fPlat = plat; c.bvpConf = bvpConf;
+  let comp = wsum > 0 ? terms.reduce((s, t) => s + t[0] * t[1], 0) / wsum : null;
+  const pf = c.park?.pf ?? 100;
+  if (comp != null) comp = clamp(comp + clamp((pf - 100) * 0.35, -4, 4), 0, 100);
+  c.score = comp != null ? Math.round(comp * 10) / 10 : null;
+  const avgs = [];
+  if (c.l15Avg != null) avgs.push([c.l15Avg, 3]);
+  if (c.seasonAvg != null) avgs.push([c.seasonAvg, 2]);
+  const bAvg2 = o && o.hand === 'L' ? c.avgVsL : c.avgVsR;
+  if (bAvg2 != null) avgs.push([bAvg2, 1]);
+  if (c.bvpAvg != null && c.bvpAB >= 8) avgs.push([c.bvpAvg, bvpConf]);
+  if (o?.baa != null) avgs.push([o.baa, 1.5]);
+  if (avgs.length) {
+    const w = avgs.reduce((s, a) => s + a[1], 0);
+    let adj = avgs.reduce((s, a) => s + a[0] * a[1], 0) / w;
+    adj *= (pf / 100);
+    c.estP = (1 - Math.pow(1 - clamp(adj, .15, .4), EXP_AB)) * 100;
+  } else c.estP = null;
+}
+
+async function buildBoard(core, date) {
+  const season = date.slice(0, 4);
+  const [sched, teamsResp] = await Promise.all([
+    getJSON(`${API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher,lineups`),
+    getJSON(`${API}/teams?sportId=1&season=${season}`)
+  ]);
+  const abbr = {}; (teamsResp?.teams || []).forEach(t => abbr[t.id] = t.abbreviation || t.teamName || t.name);
+  const games = sched?.dates?.[0]?.games || [];
+  if (!games.length) { log('no MLB games for', date); return null; }
+  log(games.length, 'games on the slate');
+
+  const teamCtx = {}, lineupIds = new Set(), lineupOrder = {}; let anyLineup = false;
+  for (const g of games) {
+    const home = g.teams.home, away = g.teams.away;
+    const label = `${abbr[away.team.id] || away.team.name} @ ${abbr[home.team.id] || home.team.name}`;
+    const park = { name: g.venue?.name || '', pf: PARK_FACTORS[abbr[home.team.id]] ?? 100 };
+    teamCtx[home.team.id] = { opp: away.probablePitcher || null, label, gamePk: g.gamePk, park, firstPitch: g.gameDate };
+    teamCtx[away.team.id] = { opp: home.probablePitcher || null, label, gamePk: g.gamePk, park, firstPitch: g.gameDate };
+    const lu = g.lineups;
+    if (lu) {
+      (lu.homePlayers || []).forEach((p, i) => { lineupIds.add(p.id); lineupOrder[p.id] = i + 1; anyLineup = true; });
+      (lu.awayPlayers || []).forEach((p, i) => { lineupIds.add(p.id); lineupOrder[p.id] = i + 1; anyLineup = true; });
     }
   }
-  const teamsPlaying=new Set(Object.keys(ctx).map(Number));
-  // bulk stats
-  async function bulk(stat,extra){ const out=[];
-    for(let off=0;off<3000;off+=1000){
-      const d=await J(`${API}/stats?stats=${stat}&group=hitting&season=${season}&playerPool=ALL&limit=1000&offset=${off}${extra||''}`);
-      const s=d?.stats?.[0]?.splits||[]; out.push(...s); if(s.length<1000)break;
-    } return out; }
-  const [seasonS,recentS]=await Promise.all([bulk('season',''),bulk('byDateRange',`&startDate=${daysAgo(date,21)}&endDate=${date}`)]);
-  const rec={}; recentS.forEach(s=>{ if(s.player) rec[s.player.id]=s.stat; });
-  let cand=seasonS.filter(s=>s.player&&s.team&&teamsPlaying.has(s.team.id)&&s.position?.abbreviation!=='P')
-    .map(s=>{const r=rec[s.player.id]||{};return{id:s.player.id,name:s.player.fullName,teamId:s.team.id,team:abbr[s.team.id],
-      seasonAvg:num(s.stat.avg),seasonPA:s.stat.plateAppearances||0,recAvg:num(r.avg),recPA:r.plateAppearances||0};})
-    .filter(p=>p.recPA>=20&&p.seasonPA>=60);
-  cand.forEach(p=>{p.prelim=(scale(p.recAvg,.18,.34)??40)*.6+(scale(p.seasonAvg,.18,.34)??40)*.4+(lineupOrder[p.id]?8:0);});
-  cand.sort((a,b)=>b.prelim-a.prelim);
-  // cold tier: weakest qualifying bats — Under candidates for the O/U engine
-  const hot=cand.slice(0,90), inPool=new Set(hot.map(c=>c.id));
-  const cold=cand.slice(-35).filter(c=>!inPool.has(c.id));
-  cold.forEach(c=>c.coldTier=true);
-  cand=[...hot,...cold];
-  console.log('pool:',hot.length,'hitters +',cold.length,'cold-tier bats');
-  // savant
-  async function savant(type,sel){
-    const t=await T(`https://baseballsavant.mlb.com/leaderboard/custom?year=${season}&type=${type}&filter=&min=10&selections=${sel}&chart=false&x=xba&y=xba&r=no&chartType=beeswarm&csv=true`);
-    const m={}; if(t&&!t.trim().startsWith('<')) parseCSV(t).forEach(r=>{const id=+r.player_id; if(id)m[id]=r;}); return m;
-  }
-  const [savP,savB]=await Promise.all([
-    savant('pitcher','xba,exit_velocity_avg,barrel_batted_rate,hard_hit_percent,whiff_percent,k_percent,iz_contact_percent,linedrives_percent'),
-    savant('batter','xba,k_percent,whiff_percent,hard_hit_percent,exit_velocity_avg,sweet_spot_percent')]);
-  // hands
-  const pids=[...new Map(Object.values(ctx).filter(c=>c.opp).map(c=>[c.opp.id,c.opp])).values()];
-  const hands={};
-  for(let i=0;i<cand.length+pids.length;i+=100){
-    const ids=[...cand.map(c=>c.id),...pids.map(p=>p.id)].slice(i,i+100); if(!ids.length)break;
-    const d=await J(`${API}/people?personIds=${ids.join(',')}`);
-    (d?.people||[]).forEach(p=>hands[p.id]={bats:p.batSide?.code||'?',throws:p.pitchHand?.code||'?'});
-  }
-  // pitchers
-  const pInfo={};
-  await pool(pids.map(pr=>async()=>{
-    const [gl,sp,se]=await Promise.all([
-      J(`${API}/people/${pr.id}/stats?stats=gameLog&group=pitching&season=${season}&gameType=R`),
-      J(`${API}/people/${pr.id}/stats?stats=statSplits&group=pitching&sitCodes=vl,vr&season=${season}`),
-      J(`${API}/people/${pr.id}/stats?stats=season&group=pitching&season=${season}`)]);
-    const logs=(gl?.stats?.[0]?.splits||[]).slice(-5); let ip=0,h=0;
-    logs.forEach(g=>{ip+=ipF(g.stat.inningsPitched);h+=g.stat.hits||0;});
-    const o={id:pr.id,name:pr.fullName,hand:hands[pr.id]?.throws||'?',h9L5:ip>0?h/ip*9:null,ipL5:ip};
-    (sp?.stats?.[0]?.splits||[]).forEach(x=>{if(x.split?.code==='vl')o.baaVsL=num(x.stat.avg);if(x.split?.code==='vr')o.baaVsR=num(x.stat.avg);});
-    const ss=se?.stats?.[0]?.splits?.[0]?.stat; if(ss){o.baa=num(ss.avg);o.whip=num(ss.whip);}
-    const sv=savP[pr.id]||{};
-    Object.assign(o,{xba:num(sv.xba),kpct:num(sv.k_percent),whiff:num(sv.whiff_percent),hardhit:num(sv.hard_hit_percent),ld:num(sv.linedrives_percent),izcontact:num(sv.iz_contact_percent)});
-    pInfo[pr.id]=o;
-  }),5);
-  // odds — FREE-TIER BUDGET MODE:
-  //   · each game's props fetched at most twice (initial + one retry if empty)
-  //   · only inside the 11:00–19:30 ET posting window
-  //   · hard cap of 16 credits/day; prices cached in the ledger all day and
-  //     shared with the dashboard, so nothing is ever fetched twice.
-  const DAILY_BUDGET=34, WINDOW=[11,22.5];
-  if(L.oddsCache?.date!==date) L.oddsCache={date, prices:{}, events:{}, spent:0};
-  const OC=L.oddsCache;
-  const odds=new Map(Object.entries(OC.prices));
-  const etHour=(()=>{const p=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour:'numeric',minute:'numeric',hour12:false}).formatToParts(new Date());
-    return +p.find(x=>x.type==='hour').value + (+p.find(x=>x.type==='minute').value)/60;})();
-  if(ODDS_KEY && etHour>=WINDOW[0] && etHour<=WINDOW[1] && OC.spent<DAILY_BUDGET){
-    const evs=await J(`https://api.the-odds-api.com/v4/sports/baseball_mlb/events?apiKey=${ODDS_KEY}`); // events list = 0 credits
-    const todays=(evs||[]).filter(e=>new Date(e.commence_time).toLocaleDateString('en-CA',{timeZone:'America/New_York'})===date);
-    for(const ev of todays){
-      const st=OC.events[ev.id]||(OC.events[ev.id]={tries:0,priced:false,closed:false});
-      if(new Date(ev.commence_time).getTime()<=Date.now()) continue; // game started, prices moot
-      const minsToPitch=(new Date(ev.commence_time).getTime()-Date.now())/60000;
-      const closingWindow = minsToPitch<=100;
-      // closing pass: one refetch near first pitch — completes late-posting players (bench bats)
-      // and captures true closing prices so backfilled units are accurate
-      if(st.priced && !(closingWindow && !st.closed)) continue;
-      if(!st.priced && st.tries>=2) continue;
-      if(OC.spent>=DAILY_BUDGET) continue;
-      if(closingWindow) st.closed=true;
-      st.tries++; OC.spent++;
-      const d=await J(`https://api.the-odds-api.com/v4/sports/baseball_mlb/events/${ev.id}/odds?apiKey=${ODDS_KEY}&regions=us&bookmakers=draftkings&markets=batter_hits&oddsFormat=american`);
-      const mk=d?.bookmakers?.[0]?.markets?.find(m=>m.key==='batter_hits');
-      let n=0;
-      (mk?.outcomes||[]).forEach(oc=>{ if(!oc.description) return;
-        const k=normName(oc.description), line=oc.point??0.5, v=Math.round(oc.price);
-        if(oc.name==='Over'&&line===0.5){ odds.set(k,v); OC.prices[k]=v; n++; }
-        OC.ou=OC.ou||{}; const e=OC.ou[k]||(OC.ou[k]={line});
-        if(e.line===line){ if(oc.name==='Over') e.over=v; else e.under=v; } });
-      if(n>0) st.priced=true;
+  // fill missing probables from live feed
+  const missing = games.filter(g => !g.teams.home.probablePitcher || !g.teams.away.probablePitcher);
+  await pool(missing.map(g => async () => {
+    const feed = await getJSON(`https://statsapi.mlb.com/api/v1.1/game/${g.gamePk}/feed/live`);
+    const pp = feed?.gameData?.probablePitchers;
+    if (pp?.away && !g.teams.away.probablePitcher) { g.teams.away.probablePitcher = pp.away; teamCtx[g.teams.home.team.id].opp = pp.away; }
+    if (pp?.home && !g.teams.home.probablePitcher) { g.teams.home.probablePitcher = pp.home; teamCtx[g.teams.away.team.id].opp = pp.home; }
+  }), 6);
+
+  const probables = [...new Map(Object.values(teamCtx).filter(c => c.opp).map(c => [c.opp.id, c.opp])).values()];
+  log(probables.length, 'probable pitchers');
+  const playingTeams = new Set(Object.keys(teamCtx).map(Number));
+
+  // bulk hitting: season + recent window
+  async function bulk(statType, extra) {
+    const splits = [];
+    for (let off = 0; off < 3000; off += 1000) {
+      const d = await getJSON(`${API}/stats?stats=${statType}&group=hitting&season=${season}&playerPool=ALL&limit=1000&offset=${off}${extra || ''}`);
+      const s = d?.stats?.[0]?.splits || []; splits.push(...s);
+      if (s.length < 1000) break;
     }
-    // backfill null odds throughout today's ledger from the freshest cache
-    let bf=0;
-    const d=L.days[date];
-    if(d) Object.values(d.rows).forEach(r=>{
-      const k=normName(r.n), v=OC.prices[k]!=null?+OC.prices[k]:null;
-      if(v!=null){
-        if(r.od==null){r.od=v;bf++;}
-        if(r.picked&&r.pickOdds==null){r.pickOdds=v;bf++;}
-        if(r.bot&&r.botOdds==null){r.botOdds=v;bf++;}
-        if(r.mit&&r.mitOdds==null){r.mitOdds=v;bf++;}
-        if(r.bks) Object.keys(r.bks).forEach(b=>{if(r.bks[b]==null){r.bks[b]=v;bf++;}});
+    return splits;
+  }
+  const startD = daysAgoISO(date, FORM_DAYS);
+  const [seasonSplits, recentSplits] = await Promise.all([bulk('season', ''), bulk('byDateRange', `&startDate=${startD}&endDate=${date}`)]);
+  const recentById = {}; recentSplits.forEach(s => { if (s.player) recentById[s.player.id] = s.stat; });
+  const candidates = seasonSplits
+    .filter(s => s.player && s.team && playingTeams.has(s.team.id) && s.position?.abbreviation !== 'P')
+    .map(s => {
+      const r = recentById[s.player.id] || {};
+      return { id: s.player.id, name: s.player.fullName, teamId: s.team.id, team: abbr[s.team.id] || s.team.name,
+        seasonAvg: num(s.stat.avg), seasonPA: s.stat.plateAppearances || 0,
+        recAvg: num(r.avg), recPA: r.plateAppearances || 0, recG: r.gamesPlayed || 0, recH: r.hits || 0 };
+    })
+    .sort((a, b) => (b.recPA - a.recPA) || (b.seasonPA - a.seasonPA))
+    .slice(0, DEPTH);
+
+  // pitcher profiles
+  const savant = await fetchSavant(core, date);
+  const pInfo = {};
+  await pool(probables.map(pr => async () => {
+    const info = pInfo[pr.id] = { id: pr.id, name: pr.fullName, hand: '?', spin: null };
+    const [person, stats, splits, l5] = await Promise.all([
+      getJSON(`${API}/people/${pr.id}`),
+      getJSON(`${API}/people/${pr.id}/stats?stats=season&group=pitching&season=${season}`),
+      getJSON(`${API}/people/${pr.id}/stats?stats=statSplits&group=pitching&sitCodes=vl,vr&season=${season}`),
+      getJSON(`${API}/people/${pr.id}/stats?stats=gameLog&group=pitching&season=${season}&gameType=R`)
+    ]);
+    info.hand = person?.people?.[0]?.pitchHand?.code || '?';
+    const ss = stats?.stats?.[0]?.splits?.[0]?.stat;
+    if (ss) {
+      info.baa = num(ss.avg); info.whip = num(ss.whip);
+      const H = ss.hits, HR = ss.homeRuns, AB = ss.atBats, SO = ss.strikeOuts, SF = ss.sacFlies || 0, BF = ss.battersFaced;
+      const den = (AB ?? 0) - (SO ?? 0) - (HR ?? 0) + SF;
+      if (H != null && den > 0) info.babip = (H - HR) / den;
+      if (SO != null && BF > 0) info.kpct = SO / BF * 100;
+    }
+    (splits?.stats?.[0]?.splits || []).forEach(sp => {
+      if (sp.split?.code === 'vl') info.baaVsL = num(sp.stat.avg);
+      if (sp.split?.code === 'vr') info.baaVsR = num(sp.stat.avg);
+    });
+    const logs = (l5?.stats?.[0]?.splits || []).slice(-5);
+    let ip = 0, h = 0;
+    logs.forEach(g => { ip += num(g.stat.inningsPitched) || 0; h += g.stat.hits || 0; });
+    if (ip > 0) { info.h9L5 = h / ip * 9; info.ipL5 = ip; }
+    const sv = savant.pit[pr.id];
+    if (sv) { Object.assign(info, sv); if (sv.kpct != null) info.kpct = sv.kpct; }
+  }), 5);
+
+  // team recent games + starters, for the last-10 strip context (light version)
+  // bat sides
+  for (let i = 0; i < candidates.length; i += 100) {
+    const ids = candidates.slice(i, i + 100).map(c => c.id).join(',');
+    const ppl = await getJSON(`${API}/people?personIds=${ids}`);
+    const map = {}; (ppl?.people || []).forEach(p => map[p.id] = p.batSide?.code || '?');
+    candidates.slice(i, i + 100).forEach(c => c.bats = map[c.id] || '?');
+  }
+  await pool(candidates.map(c => async () => {
+    const ctx = teamCtx[c.teamId]; const opp = ctx?.opp ? pInfo[ctx.opp.id] : null;
+    c.game = ctx?.label || ''; c.opp = opp || null; c.gamePk = ctx?.gamePk || null;
+    c.firstPitch = ctx?.firstPitch || null;
+    c.confirmed = lineupIds.has(c.id);
+    c.st = savant.bat[c.id] || {};
+    c.order = lineupOrder[c.id] || null;
+    c.expAB = c.order ? [4.4, 4.3, 4.2, 4.1, 4.0, 3.8, 3.6, 3.4, 3.3][c.order - 1] : 3.8;
+    const calls = [
+      getJSON(`${API}/people/${c.id}/stats?stats=gameLog&group=hitting&season=${season}&gameType=R`),
+      getJSON(`${API}/people/${c.id}/stats?stats=statSplits&group=hitting&sitCodes=vl,vr&season=${season}`)
+    ];
+    if (opp) calls.push(getJSON(`${API}/people/${c.id}/stats?stats=vsPlayerTotal&group=hitting&opposingPlayerId=${opp.id}`));
+    const [glog, splits, bvp] = await Promise.all(calls);
+    const logs = (glog?.stats?.[0]?.splits || []).slice().sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+    const last15 = logs.slice(-FORM_GAMES);
+    let ab = 0, h = 0, hitG = 0, gwab = 0;
+    last15.forEach(g => { const gab = g.stat.atBats || 0, gh = g.stat.hits || 0; ab += gab; h += gh; if (gab > 0) { gwab++; if (gh > 0) hitG++; } });
+    c.l15Avg = ab > 0 ? h / ab : null; c.l15G = last15.length; c.l15GwAB = gwab; c.l15HitG = hitG;
+    let streak = 0;
+    for (let i = logs.length - 1; i >= 0; i--) {
+      const gab = logs[i].stat.atBats || 0, gh = logs[i].stat.hits || 0;
+      if (gab === 0) continue;
+      if (gh > 0) streak++; else break;
+    }
+    c.streak = streak;
+    (splits?.stats?.[0]?.splits || []).forEach(sp => {
+      if (sp.split?.code === 'vl') c.avgVsL = num(sp.stat.avg);
+      if (sp.split?.code === 'vr') c.avgVsR = num(sp.stat.avg);
+    });
+    c.bvpAB = 0; c.bvpH = 0; c.bvpPA = 0; c.bvpAvg = null;
+    if (bvp) for (const st of (bvp.stats || [])) for (const sp of (st.splits || []))
+      if (sp.stat && sp.stat.atBats != null) { c.bvpAB = sp.stat.atBats; c.bvpH = sp.stat.hits || 0; c.bvpPA = sp.stat.plateAppearances || sp.stat.atBats; c.bvpAvg = num(sp.stat.avg); }
+  }), 8);
+
+  candidates.forEach(c => { c.park = teamCtx[c.teamId]?.park || { name: '', pf: 100 }; });
+  candidates.forEach(scoreRow);
+  const rows = candidates.filter(c => c.score != null).sort((a, b) => b.score - a.score);
+  rows.forEach((r, i) => r.rank = i + 1);
+  log('board built:', rows.length, 'hitters ranked · lineups:', anyLineup ? 'posted' : 'not yet');
+  return { rows, hasLineups: anyLineup, gamesByPk: Object.fromEntries(games.map(g => [g.gamePk, g])) };
+}
+
+/* lineup/odds refresh applied to a cached board (cheap path between rebuilds) */
+async function refreshBoardLive(board, date) {
+  const sched = await getJSON(`${API}/schedule?sportId=1&date=${date}&hydrate=lineups`);
+  const games = sched?.dates?.[0]?.games || [];
+  const lineupIds = new Set(), lineupOrder = {}; let anyLineup = false;
+  const startByPk = {};
+  for (const g of games) {
+    startByPk[g.gamePk] = { firstPitch: g.gameDate, state: g.status?.abstractGameState };
+    const lu = g.lineups; if (!lu) continue;
+    (lu.homePlayers || []).forEach((p, i) => { lineupIds.add(p.id); lineupOrder[p.id] = i + 1; anyLineup = true; });
+    (lu.awayPlayers || []).forEach((p, i) => { lineupIds.add(p.id); lineupOrder[p.id] = i + 1; anyLineup = true; });
+  }
+  board.rows.forEach(r => {
+    r.confirmed = lineupIds.has(r.id);
+    r.order = lineupOrder[r.id] || r.order || null;
+    r.expAB = r.order ? [4.4, 4.3, 4.2, 4.1, 4.0, 3.8, 3.6, 3.4, 3.3][r.order - 1] : 3.8;
+    const gi = startByPk[r.gamePk];
+    if (gi) { r.firstPitch = gi.firstPitch; r.gameState = gi.state; }
+  });
+  board.hasLineups = anyLineup;
+  return board;
+}
+
+/* ---------------- Odds API: DK 1+hit prices + hits O/U -------------------- */
+async function fetchOdds(core, date) {
+  const oc = core.oddsCache;
+  const ageMin = oc?.fetchedAt ? (Date.now() - oc.fetchedAt) / 60000 : Infinity;
+  const hourET = nowET().getHours();
+  const meaningful = hourET >= 12;             // don't burn credits before noon ET
+  if (oc?.date === date && (ageMin < 150 || !ODDS_KEY)) return oc;
+  if (!ODDS_KEY || !meaningful) return oc?.date === date ? oc : null;
+  const base = 'https://api.the-odds-api.com/v4/sports/baseball_mlb';
+  const evs = await getJSON(`${base}/events?apiKey=${ODDS_KEY}`);
+  if (!evs) return oc?.date === date ? oc : null;
+  const todays = evs.filter(e => new Date(e.commence_time).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) === date);
+  const prices = {}, ou = {};
+  await pool(todays.map(ev => async () => {
+    const d = await getJSON(`${base}/events/${ev.id}/odds?apiKey=${ODDS_KEY}&regions=us&bookmakers=draftkings&markets=batter_hits&oddsFormat=american`);
+    const mk = d?.bookmakers?.[0]?.markets?.find(m => m.key === 'batter_hits');
+    (mk?.outcomes || []).forEach(oc2 => {
+      if (!oc2.description) return;
+      const k = normName(oc2.description), line = oc2.point ?? 0.5, v = Math.round(oc2.price);
+      if (oc2.name === 'Over' && line === 0.5) prices[k] = v;
+      const e = ou[k] || (ou[k] = { line });
+      if (e.line === line) { if (oc2.name === 'Over') e.over = v; else e.under = v; }
+    });
+  }), 4);
+  core.oddsCache = { date, prices, ou, fetchedAt: Date.now() };
+  log('odds fetched:', Object.keys(prices).length, 'hitters priced across', todays.length, 'games');
+  return core.oddsCache;
+}
+function applyOddsToBoard(board, oddsCache) {
+  if (!oddsCache) return 0;
+  let n = 0;
+  board.rows.forEach(r => {
+    const k = normName(r.name);
+    const p = oddsCache.prices?.[k];
+    if (p != null) { r.dkOdds = p; r.dkImplied = impliedPct(p); if (r.estP != null) r.edge = r.estP - r.dkImplied; n++; }
+    const e = oddsCache.ou?.[k];
+    if (e && e.over != null && e.under != null) { r.ouLine = e.line; r.ouOver = e.over; r.ouUnder = e.under; }
+  });
+  return n;
+}
+
+/* ============================================================================
+   3. NEWS WIRE — Reddit + RSS + Bluesky keyword engine (+ optional Claude)
+   ========================================================================== */
+const NEWS_KEYWORDS = /\b(scratch(ed)?|not in (the )?lineup|out of (the )?lineup|out of tonight|placed on|10-day il|15-day il|injured list|day.?to.?day|left the game|exit(ed|s)? (the )?game|paternity|bereavement|optioned|designated for assignment|dfa'?d|benched|sitting|getting a day)\b/i;
+async function scanNews(rows) {
+  const headlines = [];
+  // Reddit
+  for (const sub of ['fantasybaseball', 'baseball']) {
+    const d = await getJSON(`https://www.reddit.com/r/${sub}/new.json?limit=40`, 2);
+    (d?.data?.children || []).forEach(c => { const t = c.data?.title; if (t) headlines.push({ src: 'r/' + sub, text: t, at: (c.data.created_utc || 0) * 1000 }); });
+  }
+  // RSS feeds
+  for (const feed of ['https://www.espn.com/espn/rss/mlb/news', 'https://www.mlb.com/feeds/news/rss.xml', 'https://www.rotowire.com/rss/news.php?sport=MLB']) {
+    const t = await getText(feed);
+    if (!t) continue;
+    const src = feed.split('/')[2];
+    for (const m of t.matchAll(/<title>(?:<!\[CDATA\[)?([^<\]]{10,200})(?:\]\]>)?<\/title>/g))
+      headlines.push({ src, text: m[1], at: Date.now() });
+  }
+  // Bluesky public search
+  const bs = await getJSON('https://api.bsky.app/xrpc/app.bsky.feed.searchPosts?q=' + encodeURIComponent('mlb scratched lineup') + '&limit=25', 1);
+  (bs?.posts || []).forEach(p => { const t = p.record?.text; if (t) headlines.push({ src: 'bsky', text: t.slice(0, 220), at: Date.parse(p.indexedAt) || Date.now() }); });
+
+  const cutoff = Date.now() - 20 * 3600 * 1000;
+  const recent = headlines.filter(h => !h.at || h.at > cutoff);
+  const flags = new Map(); // id -> {reason, src}
+  for (const r of rows) {
+    const nn = normName(r.name);
+    const last = nn.split(' ').slice(-1)[0];
+    for (const h of recent) {
+      const ht = normName(h.text);
+      if (!NEWS_KEYWORDS.test(h.text)) continue;
+      if (ht.includes(nn) || (last.length > 4 && ht.includes(last) && ht.includes(nn.split(' ')[0]))) {
+        flags.set(r.id, { reason: h.text.slice(0, 140), src: h.src });
+        break;
       }
-      const e=(OC.ou||{})[k];
-      if(e&&r.ou) Object.values(r.ou).forEach(x=>{ if(x.odds==null&&x.line===e.line){x.odds=x.side==='O'?e.over:e.under; if(x.odds!=null)bf++;} });
-    });
-    if(bf) console.log('backfilled',bf,'missing price fields in today\'s ledger');
-    console.log(`odds budget: ${OC.spent}/${DAILY_BUDGET} credits today · ${Object.values(OC.events).filter(e=>e.priced).length}/${todays.length} games priced`);
-  } else if(ODDS_KEY){
-    console.log(`odds: using cache (${odds.size} prices) — ${etHour<WINDOW[0]||etHour>WINDOW[1]?'outside posting window':'daily budget reached'}`);
+    }
   }
-  console.log('DK prices:',odds.size);
-  // per-candidate detail
-  const rows=[];
-  await pool(cand.map(c=>async()=>{
-    const cx=ctx[c.teamId]; const opp=cx?.opp?pInfo[cx.opp.id]:null;
-    const [gl,sp,bvp]=await Promise.all([
-      J(`${API}/people/${c.id}/stats?stats=gameLog&group=hitting&season=${season}&gameType=R`),
-      J(`${API}/people/${c.id}/stats?stats=statSplits&group=hitting&sitCodes=vl,vr&season=${season}`),
-      opp?J(`${API}/people/${c.id}/stats?stats=vsPlayerTotal&group=hitting&opposingPlayerId=${opp.id}`):null]);
-    const logs=(gl?.stats?.[0]?.splits||[]).sort((a,b)=>(a.date||'').localeCompare(b.date||''));
-    const l15=logs.slice(-15); let ab=0,h=0,hitG=0,gwab=0;
-    l15.forEach(g=>{const a=g.stat.atBats||0,hh=g.stat.hits||0;ab+=a;h+=hh;if(a>0){gwab++;if(hh>0)hitG++;}});
-    let streak=0; for(let i=logs.length-1;i>=0;i--){const a=logs[i].stat.atBats||0;if(!a)continue;if((logs[i].stat.hits||0)>0)streak++;else break;}
-    const r={...c,bats:hands[c.id]?.bats||'?',opp,game:cx?.label,gamePk:cx?.gamePk,park:cx?.park,
-      firstPitch:firstPitch[c.teamId], order:lineupOrder[c.id]||null, confirmed:!!lineupOrder[c.id],
-      expAB:lineupOrder[c.id]?[4.4,4.3,4.2,4.1,4.0,3.8,3.6,3.4,3.3][lineupOrder[c.id]-1]:3.8,
-      l15Avg:ab>0?h/ab:null,l15GwAB:gwab,l15HitG:hitG,streak,
-      st:(m=>({xba:num(m.xba),k:num(m.k_percent),whiff:num(m.whiff_percent),hh:num(m.hard_hit_percent),ev:num(m.exit_velocity_avg),ss:num(m.sweet_spot_percent)}))(savB[c.id]||{}),
-      bvpAB:0,bvpH:0,bvpPA:0,bvpAvg:null};
-    (sp?.stats?.[0]?.splits||[]).forEach(x=>{if(x.split?.code==='vl')r.avgVsL=num(x.stat.avg);if(x.split?.code==='vr')r.avgVsR=num(x.stat.avg);});
-    if(bvp) for(const st of bvp.stats||[]) for(const s2 of st.splits||[]) if(s2.stat?.atBats!=null){r.bvpAB=s2.stat.atBats;r.bvpH=s2.stat.hits||0;r.bvpPA=s2.stat.plateAppearances||r.bvpAB;r.bvpAvg=num(s2.stat.avg);}
-    r.dkOdds=odds.get(normName(c.name))??null;
-    const ouE=(L.oddsCache?.ou||{})[normName(c.name)];
-    if(ouE&&ouE.over!=null&&ouE.under!=null){ r.ouLine=ouE.line; r.ouOver=ouE.over; r.ouUnder=ouE.under; }
-    r.dkImplied=r.dkOdds==null?null:(r.dkOdds<0?-r.dkOdds/(-r.dkOdds+100)*100:100/(r.dkOdds+100)*100);
-    rows.push(r);
-  }),6);
-  scoreAll(rows);
-  return {rows, date};
+  // optional Claude comprehension pass to cut false positives
+  if (ANTH_KEY && flags.size) {
+    for (const [id, f] of [...flags]) {
+      const r = rows.find(x => x.id === id);
+      try {
+        const resp = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-api-key': ANTH_KEY, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({
+            model: 'claude-haiku-4-5-20251001', max_tokens: 5,
+            messages: [{ role: 'user', content: `Headline: "${f.reason}"\nDoes this headline say that MLB player ${r.name} is OUT of today's lineup, scratched, injured, or otherwise unavailable to bat today? Answer only YES or NO.` }]
+          })
+        });
+        if (resp.ok) {
+          const j = await resp.json();
+          const ans = (j.content?.[0]?.text || '').trim().toUpperCase();
+          if (ans.startsWith('NO')) { flags.delete(id); log('Claude cleared false flag:', r.name); }
+        }
+      } catch (e) { /* keyword verdict stands */ }
+    }
+  }
+  if (flags.size) log('news flags:', [...flags.keys()].map(id => rows.find(r => r.id === id)?.name).join(', '));
+  return flags;
 }
 
-function scoreAll(rows){
-  rows.forEach(r=>{
-    const o=r.opp||{};
-    let form=null; if(r.l15GwAB>=5){const hr=r.l15HitG/r.l15GwAB;
-      form=clamp(.5*(scale(r.l15Avg,.18,.34)??40)+.2*(scale(r.seasonAvg,.18,.34)??40)+30*hr+Math.min(r.streak*2,12)-6,0,100);}
-    let bvp=null,conf=0; if(r.bvpAB>=4&&r.bvpAvg!=null){bvp=scale(r.bvpAvg,.15,.4);conf=clamp(r.bvpPA/18,0,1);}
-    const parts=[]; const add=(v,w)=>{if(v!=null)parts.push([v,w]);};
-    add(o.xba!=null?scale(o.xba,.21,.29):null,.22); add(o.kpct!=null?100-scale(o.kpct,14,30):null,.14);
-    add(o.h9L5!=null&&o.ipL5>=8?scale(o.h9L5,6.5,12.5):null,.12); add(o.whiff!=null?100-scale(o.whiff,18,32):null,.10);
-    add(o.hardhit!=null?scale(o.hardhit,30,48):null,.10); add(o.ld!=null?scale(o.ld,18,30):null,.07);
-    add(o.baa!=null?scale(o.baa,.2,.31):null,.06);
-    let pit=null; if(parts.length){const w=parts.reduce((s,p)=>s+p[1],0);pit=parts.reduce((s,p)=>s+p[0]*p[1],0)/w;}
-    let plat=null; if(o.hand&&o.hand!=='?'){const bS=o.hand==='L'?r.avgVsL:r.avgVsR;
-      const side=r.bats==='S'?(o.hand==='L'?'R':'L'):r.bats; const pB=side==='L'?o.baaVsL:side==='R'?o.baaVsR:null;
-      const pp=[]; if(bS!=null)pp.push(scale(bS,.18,.34)); if(pB!=null)pp.push(scale(pB,.2,.32));
-      if(pp.length)plat=pp.reduce((a,b)=>a+b,0)/pp.length;}
-    const terms=[]; if(form!=null)terms.push([form,.35]); if(bvp!=null)terms.push([bvp,.25*conf]);
-    if(pit!=null)terms.push([pit,.25]); if(plat!=null)terms.push([plat,.15]);
-    const w=terms.reduce((s,t)=>s+t[1],0);
-    let comp=w>0?terms.reduce((s,t)=>s+t[0]*t[1],0)/w:null;
-    const pf=r.park?.pf??100; if(comp!=null)comp=clamp(comp+clamp((pf-100)*.35,-4,4),0,100);
-    r.score=comp!=null?Math.round(comp*10)/10:null; r.fPit=pit;
-    // est prob
-    const avgs=[]; if(r.l15Avg!=null)avgs.push([r.l15Avg,3]); if(r.seasonAvg!=null)avgs.push([r.seasonAvg,2]);
-    const bS2=o.hand==='L'?r.avgVsL:r.avgVsR; if(bS2!=null)avgs.push([bS2,1]); if(o.baa!=null)avgs.push([o.baa,1.5]);
-    if(avgs.length){const ww=avgs.reduce((s,a)=>s+a[1],0);let adj=avgs.reduce((s,a)=>s+a[0]*a[1],0)/ww*(pf/100);
-      r.estP=(1-Math.pow(1-clamp(adj,.15,.4),r.expAB||3.8))*100;}
-    r.edge=(r.estP!=null&&r.dkImplied!=null)?r.estP-r.dkImplied:null;
-  });
-  rows.sort((a,b)=>(b.score??0)-(a.score??0));
-}
-
-// ---------- strategies (mirror the dashboard) ----------
-function mittsEval(r){ const o=r.opp||{};
-  if(r.seasonAvg==null||r.l15Avg==null)return{ok:false};
-  const base=.5*r.seasonAvg+.3*r.l15Avg+.2*(r.recAvg??r.seasonAvg); let p=base;
-  const bS=o.hand==='L'?r.avgVsL:r.avgVsR;
-  const side=r.bats==='S'?(o.hand==='L'?'R':'L'):r.bats;
-  const pB=side==='L'?o.baaVsL:side==='R'?o.baaVsR:null;
-  if(bS!=null)p+=(bS-base)*.3; if(pB!=null)p+=(pB-.245)*.35;
-  if(o.xba!=null)p+=(o.xba-.245)*.45; if(o.kpct!=null)p+=(.22-o.kpct/100)*.28; if(o.whiff!=null)p+=(.24-o.whiff/100)*.18;
-  if(o.h9L5!=null&&o.ipL5>=8)p+=(o.h9L5-8.6)*.004;
-  if(r.bvpAvg!=null&&r.bvpPA>=6){const w=r.bvpPA>=30?.14:r.bvpPA>=18?.10:r.bvpPA>=12?.06:.03;p+=(r.bvpAvg-base)*w;}
-  p*=(r.park?.pf??100)/100; p=clamp(p,.15,.4);
-  const prob=(1-Math.pow(1-p,r.expAB||3.8))*100;
-  const edge=r.dkImplied!=null?prob-r.dkImplied:null;
-  const hitRate=r.l15GwAB>0?r.l15HitG/r.l15GwAB:0;
-  const ok=r.dkOdds!=null&&(!r.confirmedKnown||r.confirmed)&&!(r.order>=8&&(edge==null||edge<10))&&hitRate>=.5&&(r.recPA||0)>=30
-    &&!(bS!=null&&bS<.215)&&prob>=63&&edge!=null&&edge>=7;
-  return{ok,prob,edge};
-}
-const STRATS=[
- {id:'r5', pick:rows=>rows.filter(r=>r.score!=null).slice(0,3)},
- {id:'mit', pick:rows=>rows.map(r=>({r,m:mittsEval(r)})).filter(x=>x.m.ok).sort((a,b)=>b.m.edge-a.m.edge).slice(0,3).map(x=>x.r)},
- {id:'chalky', pick:rows=>top(rows,r=>{const st=r.st||{},o=r.opp||{};const hr=r.l15GwAB>0?r.l15HitG/r.l15GwAB:0;
-   if((st.k??99)>23||hr<.55)return null;return(26-(st.k??24))*3+(26-(st.whiff??24))*2+hr*60+(o.whiff!=null?(24-o.whiff)*1.5:0)+(r.l15Avg??.25)*60;})},
- {id:'gapper', pick:rows=>top(rows,r=>{const st=r.st||{},o=r.opp||{};if((st.xba??0)<.255)return null;
-   return(st.xba??.24)*400+(st.hh??35)+(st.ss??32)*.5+(o.xba!=null?(o.xba-.245)*300:0)+(o.hardhit??38)*.5+(o.ld??22);})},
- {id:'sal', pick:rows=>top(rows,r=>{const o=r.opp||{};if(!o.hand||o.hand==='?')return null;
-   const bS=o.hand==='L'?r.avgVsL:r.avgVsR;const side=r.bats==='S'?(o.hand==='L'?'R':'L'):r.bats;
-   const pB=side==='L'?o.baaVsL:side==='R'?o.baaVsR:null;
-   if(bS==null||pB==null||bS<.27||pB<.255)return null;return(bS-.245)*600+(pB-.245)*600+(r.l15Avg??.25)*100;})},
- {id:'parkey', pick:rows=>top(rows,r=>{const o=r.opp||{},pf=r.park?.pf??100,st=r.st||{};if(pf<100)return null;
-   return(pf-100)*7+(o.h9L5!=null?o.h9L5*4:30)+(24-(st.k??24))+(r.l15Avg??.25)*120;})},
- {id:'fadey', pick:rows=>top(rows,r=>{if(r.dkOdds==null||r.estP==null||r.dkImplied==null)return null;
-   const e=r.estP-r.dkImplied;if(r.dkOdds<-160||e<4||r.estP<55)return null;return r.dkOdds+e*12;})},
- {id:'streaks', pick:rows=>top(rows,r=>{if((r.streak??0)<3)return null;const hr=r.l15GwAB>0?r.l15HitG/r.l15GwAB:0;
-   const heat=(r.l15Avg!=null&&r.seasonAvg!=null)?Math.max(0,r.l15Avg-r.seasonAvg):0;return r.streak*9+hr*50+heat*250;})},
- {id:'grinder', pick:rows=>top(rows,r=>{if((r.bvpPA??0)<10||(r.bvpAvg??0)<.28)return null;
-   return r.bvpAvg*200*Math.log(r.bvpPA)+(r.opp?.h9L5!=null?r.opp.h9L5*3:24);})},
+/* ============================================================================
+   4. THE NINE BOTS — exact ports of the dashboard strategies
+   ========================================================================== */
+const BOT_DEFS = [
+  { id: 'chalky', name: 'Chalky', score(r) { const st = r.st || {}, o = r.opp || {};
+      const hitRate = r.l15GwAB > 0 ? r.l15HitG / r.l15GwAB : 0;
+      if ((st.k ?? 99) > 23 || hitRate < .55) return null;
+      return (26 - (st.k ?? 24)) * 3 + (26 - (st.whiff ?? 24)) * 2 + hitRate * 60 + (o.whiff != null ? (24 - o.whiff) * 1.5 : 0) + (r.l15Avg ?? .25) * 60; } },
+  { id: 'gapper', name: 'Gapper', score(r) { const st = r.st || {}, o = r.opp || {};
+      if ((st.xba ?? 0) < .255) return null;
+      return (st.xba ?? .24) * 400 + (st.hh ?? 35) + (st.ss ?? 32) * .5 + (o.xba != null ? (o.xba - .245) * 300 : 0) + (o.hardhit ?? 38) * .5 + (o.ld ?? 22); } },
+  { id: 'sal', name: 'Southpaw Sal', score(r) { const o = r.opp || {}; if (!o.hand || o.hand === '?') return null;
+      const bS = o.hand === 'L' ? r.avgVsL : r.avgVsR;
+      const side = r.bats === 'S' ? (o.hand === 'L' ? 'R' : 'L') : r.bats;
+      const pB = side === 'L' ? o.baaVsL : side === 'R' ? o.baaVsR : null;
+      if (bS == null || pB == null || bS < .27 || pB < .255) return null;
+      return (bS - .245) * 600 + (pB - .245) * 600 + (r.l15Avg ?? .25) * 100; } },
+  { id: 'parkey', name: 'Parkey', score(r) { const o = r.opp || {}, pf = r.park?.pf ?? 100, st = r.st || {};
+      if (pf < 100) return null;
+      return (pf - 100) * 7 + (o.h9L5 != null ? o.h9L5 * 4 : 30) + (24 - (st.k ?? 24)) + (r.l15Avg ?? .25) * 120; } },
+  { id: 'fadey', name: 'Fadey', score(r) { if (r.dkOdds == null || r.estP == null || r.dkImplied == null) return null;
+      const edge = r.estP - r.dkImplied;
+      if (r.dkOdds < -160 || edge < 4 || r.estP < 55) return null;
+      return r.dkOdds + edge * 12; } },
+  { id: 'streaks', name: 'Streaks', score(r) { if ((r.streak ?? 0) < 3) return null;
+      const hitRate = r.l15GwAB > 0 ? r.l15HitG / r.l15GwAB : 0;
+      const heat = (r.l15Avg != null && r.seasonAvg != null) ? Math.max(0, r.l15Avg - r.seasonAvg) : 0;
+      return r.streak * 9 + hitRate * 50 + heat * 250; } },
+  { id: 'grinder', name: 'The Grinder', score(r) { if ((r.bvpPA ?? 0) < 10 || (r.bvpAvg ?? 0) < .28) return null;
+      return r.bvpAvg * 200 * Math.log(r.bvpPA) + (r.opp?.h9L5 != null ? r.opp.h9L5 * 3 : 24); } },
 ];
-const NAMES={r5:'Rusty',mit:'Mitts',chalky:'Chalky',gapper:'Gapper',sal:'Southpaw Sal',parkey:'Parkey',fadey:'Fadey',streaks:'Streaks',grinder:'The Grinder'};
-function top(rows,fn){ return rows.map(r=>({r,sc:fn(r)})).filter(x=>x.sc!=null).sort((a,b)=>b.sc-a.sc).slice(0,3).map(x=>x.r); }
-
-
-// ---------- STEAM: the Mitts × Fadey fusion book ----------
-function catWL(L,id,kind){
-  let w=0,l=0;
-  Object.values(L.days).forEach(d=>Object.values(d.rows).forEach(r=>{
-    if(kind==='hit'){
-      const has=id==='mit'?r.mit:(r.bks&&r.bks[id]!==undefined);
-      if(has&&(r.res==='win'||r.res==='loss')) r.res==='win'?w++:l++;
-    } else {
-      const e=r.ou&&r.ou[id];
-      if(e&&(e.res==='win'||e.res==='loss')) e.res==='win'?w++:l++;
-    }
-  }));
-  return (w+l)>0? w/(w+l) : null;
+const PICK_WHY = {
+  r5: r => 'composite ' + (r.score ?? '—') + ', #' + (r.rank ?? '?') + ' on the board',
+  mit: r => { const m = mittsEval(r, true); return m.prob ? m.prob.toFixed(0) + '% model vs ' + (r.dkImplied?.toFixed(0) ?? '—') + '% price (' + (m.edge > 0 ? '+' : '') + (m.edge?.toFixed(1) ?? '—') + '%)' : 'value profile'; },
+  chalky: r => 'K ' + (r.st?.k?.toFixed(1) ?? 'low') + '% · hit in ' + r.l15HitG + '/' + r.l15GwAB,
+  gapper: r => 'xBA ' + fmtAvg(r.st?.xba) + ' · ' + (r.st?.hh?.toFixed(0) ?? '—') + '% hard-hit',
+  sal: r => { const o = r.opp || {}; const bS = o.hand === 'L' ? r.avgVsL : r.avgVsR; return fmtAvg(bS) + ' vs ' + o.hand + 'HP'; },
+  parkey: r => 'park ' + (r.park?.pf ?? 100) + ' · ' + (r.opp?.h9L5?.toFixed(1) ?? '—') + ' H/9',
+  fadey: r => fmtOdds(r.dkOdds) + ' price, +' + ((r.edge ?? 0).toFixed(1)) + '% edge',
+  streaks: r => (r.streak ?? 0) + '-game hit streak',
+  grinder: r => 'BvP ' + r.bvpH + '-for-' + r.bvpAB + ' (' + r.bvpPA + ' PA)',
+};
+function mittsEval(r, quiet, hasLineups) {
+  const o = r.opp || {}; const why = [];
+  if (r.seasonAvg == null || r.l15Avg == null) return { ok: false, why: ['not enough batting data'] };
+  const base = .5 * r.seasonAvg + .3 * r.l15Avg + .2 * (r.recAvg ?? r.seasonAvg);
+  let p = base;
+  const bSplit = o.hand === 'L' ? r.avgVsL : r.avgVsR;
+  const side = r.bats === 'S' ? (o.hand === 'L' ? 'R' : 'L') : r.bats;
+  const pBaa = side === 'L' ? o.baaVsL : side === 'R' ? o.baaVsR : null;
+  if (bSplit != null) p += (bSplit - base) * 0.30;
+  if (pBaa != null) p += (pBaa - .245) * 0.35;
+  if (o.xba != null) p += (o.xba - .245) * 0.45;
+  if (o.kpct != null) p += (.22 - o.kpct / 100) * 0.28;
+  if (o.whiff != null) p += (.24 - o.whiff / 100) * 0.18;
+  if (o.h9L5 != null && o.ipL5 >= 8) p += (o.h9L5 - 8.6) * 0.004;
+  if (r.bvpAvg != null && r.bvpPA >= 6) {
+    const w = r.bvpPA >= 30 ? .14 : r.bvpPA >= 18 ? .10 : r.bvpPA >= 12 ? .06 : .03;
+    p += (r.bvpAvg - base) * w;
+  }
+  p *= (r.park?.pf ?? 100) / 100;
+  p = clamp(p, .150, .400);
+  const expAB = r.expAB || 3.8;
+  const prob = (1 - Math.pow(1 - p, expAB)) * 100;
+  const edge = r.dkImplied != null ? prob - r.dkImplied : null;
+  let ok = true;
+  const hitRate = r.l15GwAB > 0 ? r.l15HitG / r.l15GwAB : 0;
+  if (r.dkOdds == null) { ok = false; why.push('no DK price posted'); }
+  if (hasLineups && !r.confirmed) { ok = false; why.push('not confirmed in lineup'); }
+  if (r.order && r.order >= 8 && (edge == null || edge < 10)) { ok = false; why.push('batting ' + r.order + 'th'); }
+  if (hitRate < .50) { ok = false; why.push('hit-game rate too low'); }
+  if ((r.recPA || 0) < 30) { ok = false; why.push('thin recent PA'); }
+  if (bSplit != null && bSplit < .215) { ok = false; why.push('platoon disadvantage'); }
+  if (r.fPit != null && r.fPit < 40) { ok = false; why.push('pitcher too tough'); }
+  if (prob < 63) { ok = false; why.push('model prob < 63%'); }
+  const tier = edge == null || edge < 4 ? null : edge < 7 ? 'lean' : edge < 11 ? 'playable' : 'strong';
+  if (!tier) ok = false;
+  return { ok, p, prob, edge, tier, expAB, why };
 }
-const bestOdds=(a,b)=> a==null?b : b==null?a : Math.max(a,b);
-function steamFile(L, date, pitchOK){
-  const d=L.days[date]; if(!d) return;
-  const hasSteamHit=Object.values(d.rows).some(r=>r.bks&&r.bks.steam!==undefined);
-  const hasSteamOU=Object.values(d.rows).some(r=>r.ou&&r.ou.steam);
-  if(!hasSteamHit){
-    const mitP=Object.values(d.rows).filter(r=>r.mit&&pitchOK(r.id));
-    const fadP=Object.values(d.rows).filter(r=>r.bks&&r.bks.fadey!==undefined&&pitchOK(r.id));
-    const fadIds=new Set(fadP.map(r=>r.id));
-    const inter=mitP.filter(r=>fadIds.has(r.id));
-    const mHot=(catWL(L,'mit','hit')??.5)>=(catWL(L,'fadey','hit')??.5);
-    const primary=mHot?mitP:fadP, hotName=mHot?'Mitts':'Fadey';
-    const chosen=[...inter];
-    for(const r of primary){ if(chosen.length>=3) break; if(!chosen.some(x=>x.id===r.id)) chosen.push(r); }
-    if(chosen.length){
-      chosen.slice(0,3).forEach(r=>{
-        r.bks=r.bks||{}; r.bks.steam=bestOdds(r.mitOdds, r.bks.fadey)??r.od??null;
-        r.why=r.why||{}; r.why.steam=inter.some(x=>x.id===r.id)?'both parents converged':'from '+hotName+' (better 1+hit win %)';
-      });
-      wire(L,'steam',`\u2668 Steam filed: ${chosen.slice(0,3).map(r=>r.n).join(', ')} (${inter.length} convergence pick${inter.length===1?'':'s'})`);
+function ouContext(r) {
+  if (r.ouLine == null || r.ouOver == null || r.ouUnder == null || r.estP == null) return null;
+  const n = r.expAB || 3.8;
+  const p = 1 - Math.pow(1 - r.estP / 100, 1 / n);
+  const p1 = r.estP / 100;
+  const p2 = 1 - Math.pow(1 - p, n) - n * p * Math.pow(1 - p, n - 1);
+  const pOver = r.ouLine < 1 ? p1 : p2;
+  const eO = pOver * 100 - impliedPct(r.ouOver);
+  const eU = (1 - pOver) * 100 - impliedPct(r.ouUnder);
+  const hitRate = r.l15GwAB > 0 ? r.l15HitG / r.l15GwAB : 0;
+  return { pOver, eO, eU, hitRate };
+}
+const OU_AFFINITY = {
+  r5: (r, c) => r.score != null && r.score >= 62 ? { side: 'O', w: r.score + c.eO * 2 } : r.score != null && r.score <= 35 ? { side: 'U', w: (100 - r.score) + c.eU * 2 } : null,
+  mit: (r, c) => { const e = Math.max(c.eO, c.eU); return e >= 5 ? { side: c.eO >= c.eU ? 'O' : 'U', w: e * 10 } : null; },
+  chalky: (r, c) => { const k = r.st?.k; if (k == null) return null;
+    if (k <= 20 && c.hitRate >= .6) return { side: 'O', w: (24 - k) * 4 + c.eO * 3 };
+    if (k >= 26 && (r.fPit ?? 50) <= 45) return { side: 'U', w: k * 2.5 + c.eU * 3 }; return null; },
+  gapper: (r, c) => { const x = r.st?.xba; if (x == null) return null;
+    if (x >= .27) return { side: 'O', w: x * 300 + c.eO * 3 };
+    if (x <= .225 && (r.opp?.xba ?? .3) <= .235) return { side: 'U', w: (240 - x * 1000) + c.eU * 3 }; return null; },
+  sal: (r, c) => { const o = r.opp || {}; if (!o.hand || o.hand === '?') return null;
+    const bS = o.hand === 'L' ? r.avgVsL : r.avgVsR; if (bS == null) return null;
+    if (bS >= .29) return { side: 'O', w: bS * 500 + c.eO * 2 };
+    if (bS <= .21) return { side: 'U', w: (300 - bS * 1000) + c.eU * 2 }; return null; },
+  parkey: (r, c) => { const pf = r.park?.pf ?? 100;
+    if (pf >= 104) return { side: 'O', w: (pf - 100) * 8 + c.eO * 2 };
+    if (pf <= 96) return { side: 'U', w: (100 - pf) * 8 + c.eU * 2 }; return null; },
+  fadey: (r, c) => { const oO = r.ouOver, uO = r.ouUnder;
+    if (oO >= 100 && c.eO >= 3) return { side: 'O', w: oO + c.eO * 10 };
+    if (uO >= 100 && c.eU >= 3) return { side: 'U', w: uO + c.eU * 10 }; return null; },
+  streaks: (r, c) => {
+    if ((r.streak ?? 0) >= 5) return { side: 'O', w: r.streak * 10 + c.eO * 2 };
+    if (c.hitRate <= .4 && (r.streak ?? 0) === 0) return { side: 'U', w: (60 - c.hitRate * 100) + c.eU * 2 }; return null; },
+  grinder: (r, c) => { if ((r.bvpPA ?? 0) < 12) return null;
+    if (r.bvpAvg >= .33) return { side: 'O', w: r.bvpAvg * 300 + c.eO * 2 };
+    if (r.bvpAvg <= .18) return { side: 'U', w: (120 - r.bvpAvg * 300) + c.eU * 2 }; return null; },
+};
+function ouWhy(bid, r, side, c) {
+  if (side === 'U') {
+    const M = { chalky: () => 'fade: ' + (r.st?.k?.toFixed(1) ?? 'high') + '% K rate',
+      gapper: () => 'fade: xBA ' + fmtAvg(r.st?.xba),
+      sal: () => { const o = r.opp || {}; const bS = o.hand === 'L' ? r.avgVsL : r.avgVsR; return 'fade: ' + fmtAvg(bS) + ' vs ' + o.hand + 'HP'; },
+      parkey: () => 'pitcher park (' + (r.park?.pf ?? 100) + ')',
+      fadey: () => 'plus-money under, +' + c.eU.toFixed(1) + '%',
+      streaks: () => 'cold: ' + ((c.hitRate * 100) | 0) + '% hit-game rate',
+      grinder: () => 'BvP ' + r.bvpH + '-for-' + r.bvpAB,
+      mit: () => 'under edge +' + c.eU.toFixed(1) + '%', r5: () => 'composite ' + (r.score ?? '—') + ' (bottom tier)' };
+    return (M[bid] || M.mit)();
+  }
+  return (PICK_WHY[bid] || PICK_WHY.r5)(r);
+}
+
+/* -------- ledger helpers (server-side mirror of the dashboard's LEDGER) --- */
+function day(core, date) { core.days = core.days || {}; if (!core.days[date]) core.days[date] = { rows: {} }; return core.days[date]; }
+function recordBoard(core, date, rows) {
+  const d = day(core, date);
+  rows.forEach(r => {
+    const prev = d.rows[r.id] || {};
+    d.rows[r.id] = {
+      id: r.id, n: r.name, t: r.team, g: r.game, rk: r.rank, gp: r.gamePk ?? prev.gp ?? null,
+      sc: r.score, ep: r.estP != null ? Math.round(r.estP * 10) / 10 : null,
+      od: r.dkOdds ?? prev.od ?? null,
+      op: r.opp?.name || '',
+      picked: prev.picked || false, pickOdds: prev.pickOdds ?? null,
+      bot: prev.bot || false, botOdds: prev.botOdds ?? null,
+      mit: prev.mit || false, mitOdds: prev.mitOdds ?? null,
+      bks: prev.bks || undefined, ou: prev.ou || undefined, why: prev.why || undefined,
+      res: prev.res ?? null
+    };
+  });
+}
+const hasBook = (core, date, bid) => {
+  const d = core.days?.[date]; if (!d) return false;
+  if (bid === 'r5') return Object.values(d.rows).some(r => r.bot);
+  if (bid === 'mit') return Object.values(d.rows).some(r => r.mit);
+  return Object.values(d.rows).some(r => r.bks && r.bks[bid] !== undefined);
+};
+const hasOU = (core, date, bid) => { const d = core.days?.[date]; return !!d && Object.values(d.rows).some(r => r.ou && r.ou[bid]); };
+const holdsHitPick = (core, date, bid, id) => {
+  const r = core.days?.[date]?.rows[id]; if (!r) return false;
+  return bid === 'r5' ? !!r.bot : bid === 'mit' ? !!r.mit : !!(r.bks && r.bks[bid] !== undefined);
+};
+const holdsOUOver05 = (core, date, bid, id) => {
+  const e = core.days?.[date]?.rows[id]?.ou?.[bid];
+  return !!(e && e.side === 'O' && e.line < 1);
+};
+function setHitPick(core, date, bid, r, why) {
+  const d = day(core, date);
+  if (!d.rows[r.id]) recordBoard(core, date, [r]);
+  const row = d.rows[r.id];
+  if (bid === 'r5') { row.bot = true; row.botOdds = r.dkOdds ?? row.od ?? null; }
+  else if (bid === 'mit') { row.mit = true; row.mitOdds = r.dkOdds ?? row.od ?? null; }
+  else { row.bks = row.bks || {}; row.bks[bid] = r.dkOdds ?? row.od ?? null; }
+  if (why) { row.why = row.why || {}; row.why[bid] = why; }
+}
+function clearHitPick(row, bid) {
+  if (bid === 'r5') { row.bot = false; row.botOdds = null; }
+  else if (bid === 'mit') { row.mit = false; row.mitOdds = null; }
+  else if (row.bks) { delete row.bks[bid]; if (!Object.keys(row.bks).length) delete row.bks; }
+  if (row.why) delete row.why[bid];
+}
+function setOUPick(core, date, bid, r, side, line, odds, why) {
+  const d = day(core, date);
+  if (!d.rows[r.id]) recordBoard(core, date, [r]);
+  const row = d.rows[r.id];
+  row.ou = row.ou || {};
+  row.ou[bid] = { side, line, odds: odds ?? null, res: null, why: why || null };
+}
+const wire = (core, who, text) => {
+  core.wire = core.wire || [];
+  core.wire.push({ t: Date.now(), who, text });
+  core.wire = core.wire.slice(-60);
+};
+const started = r => r.firstPitch && new Date(r.firstPitch).getTime() <= Date.now();
+
+/* -------- card filing --------------------------------------------------- */
+function fileCards(core, board, date, flags) {
+  const rows = board.rows;
+  const priced = rows.some(r => r.dkOdds != null);
+  const eligible = r => !flags.has(r.id) && !started(r);
+
+  // BETTER-PRICE RULE — one place, applied to every book after its card files:
+  // if a pick's hits O/U Over (same 1+hit outcome, line 0.5) pays MORE than
+  // the straight 1+hit market, take the O/U version instead.
+  function upgradeToBetterMarket(bid) {
+    const d = core.days[date]; if (!d) return;
+    Object.values(d.rows).forEach(row => {
+      if (!holdsHitPick(core, date, bid, row.id)) return;
+      const r = rows.find(x => x.id === row.id); if (!r) return;
+      const hitOdds = bid === 'r5' ? row.botOdds : bid === 'mit' ? row.mitOdds : row.bks?.[bid];
+      if (r.ouLine != null && r.ouLine < 1 && r.ouOver != null && hitOdds != null && r.ouOver > hitOdds) {
+        const oldWhy = row.why?.[bid];
+        clearHitPick(row, bid);
+        setOUPick(core, date, bid, r, 'O', r.ouLine, r.ouOver,
+          'better price than 1+hit (' + fmtOdds(r.ouOver) + ' vs ' + fmtOdds(hitOdds) + ')' + (oldWhy ? ' · ' + oldWhy : ''));
+        wire(core, bid, 'swapped ' + r.name + ' to O' + r.ouLine + ' — pays ' + fmtOdds(r.ouOver) + ' vs ' + fmtOdds(hitOdds) + ' on the hit market.');
+      }
+    });
+  }
+
+  // the 7 strategy bots
+  for (const bot of BOT_DEFS) {
+    if (hasBook(core, date, bot.id)) { upgradeToBetterMarket(bot.id); continue; }
+    const scored = rows.filter(r => eligible(r) && !holdsOUOver05(core, date, bot.id, r.id))
+      .map(r => ({ r, sc: bot.score(r) })).filter(x => x.sc != null)
+      .sort((a, b) => b.sc - a.sc).slice(0, 3);
+    if (!scored.length) continue;
+    scored.forEach(x => setHitPick(core, date, bot.id, x.r, (PICK_WHY[bot.id] || (() => ''))(x.r)));
+    wire(core, bot.id, 'card filed: ' + scored.map(x => x.r.name + ' (' + fmtOdds(x.r.dkOdds) + ')').join(', '));
+    log('🤖', bot.name, 'locked:', scored.map(x => x.r.name).join(', '));
+    upgradeToBetterMarket(bot.id);
+  }
+  // Rusty (r5): top 3 composite
+  if (!hasBook(core, date, 'r5')) {
+    const top = rows.filter(r => r.score != null && eligible(r) && !holdsOUOver05(core, date, 'r5', r.id))
+      .sort((a, b) => (b.score - a.score) || ((b.dkOdds != null) - (a.dkOdds != null))).slice(0, 3);
+    if (top.length) {
+      top.forEach(r => setHitPick(core, date, 'r5', r, PICK_WHY.r5(r)));
+      wire(core, 'r5', 'card filed: ' + top.map(r => r.name).join(', '));
+      log('🤖 Rusty locked:', top.map(r => r.name).join(', '));
     }
   }
-  if(!hasSteamOU){
-    const ent=[];
-    Object.values(d.rows).forEach(r=>{
-      const m=r.ou?.mit, f=r.ou?.fadey;
-      if(m&&f&&m.side===f.side&&m.line===f.line) ent.push({r,e:m,src:'inter',odds:bestOdds(m.odds,f.odds)});
+  upgradeToBetterMarket('r5');
+  // Mitts: edge-based, only files when the market is priced
+  if (!hasBook(core, date, 'mit') && priced) {
+    const qual = rows.filter(r => eligible(r) && !holdsOUOver05(core, date, 'mit', r.id))
+      .map(r => ({ r, m: mittsEval(r, true, board.hasLineups) }))
+      .filter(x => x.m.ok && (x.m.tier === 'playable' || x.m.tier === 'strong'))
+      .sort((a, b) => b.m.edge - a.m.edge).slice(0, 3);
+    if (qual.length) {
+      qual.forEach(x => setHitPick(core, date, 'mit', x.r, PICK_WHY.mit(x.r)));
+      wire(core, 'mit', 'card filed: ' + qual.map(x => `${x.r.name} (+${x.m.edge.toFixed(1)}%)`).join(', '));
+      log('🤖 Mitts locked:', qual.map(x => x.r.name).join(', '));
+    }
+  }
+  upgradeToBetterMarket('mit');
+
+  // O/U cards — affinity engine (only meaningful with full two-way prices)
+  if (priced) {
+    for (const [bid, aff] of Object.entries(OU_AFFINITY)) {
+      if (hasOU(core, date, bid)) continue;
+      const cands = [];
+      for (const r of rows) {
+        if (!eligible(r)) continue;
+        const c = ouContext(r); if (!c) continue;
+        const a = aff(r, c); if (!a) continue;
+        if (a.side === 'O' && r.ouLine < 1 && holdsHitPick(core, date, bid, r.id)) continue;
+        cands.push({ r, side: a.side, line: r.ouLine, odds: a.side === 'O' ? r.ouOver : r.ouUnder, w: a.w, why: ouWhy(bid, r, a.side, c) });
+      }
+      const overs = cands.filter(x => x.side === 'O').sort((a, b) => b.w - a.w);
+      const unders = cands.filter(x => x.side === 'U').sort((a, b) => b.w - a.w);
+      let picks = [...overs.slice(0, 2), ...unders.slice(0, 1)];
+      if (picks.length < 3) picks = picks.concat((unders.length > 1 ? unders.slice(1) : overs.slice(2)).slice(0, 3 - picks.length));
+      picks = picks.slice(0, 3);
+      if (picks.length < 3) continue;
+      picks.forEach(p => setOUPick(core, date, bid, p.r, p.side, p.line, p.odds, p.why));
+      wire(core, bid, 'O/U card: ' + picks.map(p => `${p.r.name} ${p.side}${p.line} (${fmtOdds(p.odds)})`).join(', '));
+    }
+  }
+
+  // Steam — child of Mitts & Fadey
+  generateSteam(core, board, date);
+}
+function seasonStandingsLite(core) {
+  const st = {};
+  const bump = (id, kind, res, od) => {
+    const o = st[id] || (st[id] = { w: 0, l: 0, ow: 0, ol: 0 });
+    if (res === 'win') { kind === 'hit' ? o.w++ : o.ow++; }
+    else if (res === 'loss') { kind === 'hit' ? o.l++ : o.ol++; }
+  };
+  Object.values(core.days || {}).forEach(d => Object.values(d.rows).forEach(r => {
+    if (r.bot) bump('r5', 'hit', r.res);
+    if (r.mit) bump('mit', 'hit', r.res);
+    if (r.bks) Object.keys(r.bks).forEach(b => bump(b, 'hit', r.res));
+    if (r.ou) Object.entries(r.ou).forEach(([b, e]) => bump(b, 'ou', e.res));
+  }));
+  return st;
+}
+function generateSteam(core, board, date) {
+  const d = core.days?.[date]; if (!d) return;
+  const ss = seasonStandingsLite(core);
+  const pct = (id, kind) => { const o = ss[id]; if (!o) return null; const w = kind === 'hit' ? o.w : o.ow, l = kind === 'hit' ? o.l : o.ol; return (w + l) > 0 ? w / (w + l) : null; };
+  const betterOdds = (a, b) => a == null ? b : b == null ? a : Math.max(a, b);
+  const pitchOK = id => { const r = board.rows.find(x => x.id == id); return !r || !started(r); };
+  if (!hasBook(core, date, 'steam')) {
+    const mitP = Object.values(d.rows).filter(r => r.mit && pitchOK(r.id) && !holdsOUOver05(core, date, 'steam', r.id));
+    const fadP = Object.values(d.rows).filter(r => r.bks && r.bks.fadey !== undefined && pitchOK(r.id) && !holdsOUOver05(core, date, 'steam', r.id));
+    const fadIds = new Set(fadP.map(r => r.id));
+    const inter = mitP.filter(r => fadIds.has(r.id));
+    const mHot = (pct('mit', 'hit') ?? .5) >= (pct('fadey', 'hit') ?? .5);
+    const primary = mHot ? mitP : fadP, hotName = mHot ? 'Mitts' : 'Fadey';
+    const chosen = [...inter];
+    for (const r of primary) { if (chosen.length >= 3) break; if (!chosen.some(x => x.id === r.id)) chosen.push(r); }
+    if (chosen.length) {
+      chosen.slice(0, 3).forEach(r => {
+        r.bks = r.bks || {}; r.bks.steam = betterOdds(r.mitOdds, r.bks.fadey) ?? r.od ?? null;
+        r.why = r.why || {};
+        r.why.steam = inter.some(x => x.id === r.id) ? 'both parents converged — sharpest signal' : 'from ' + hotName + ' (better 1+hit win %)';
+      });
+      wire(core, 'steam', 'hit card: ' + chosen.slice(0, 3).map(r => r.n).join(', '));
+    }
+  }
+  if (!hasOU(core, date, 'steam')) {
+    const ent = [];
+    Object.values(d.rows).forEach(r => {
+      const m = r.ou?.mit, f = r.ou?.fadey;
+      if (m && f && m.side === f.side && m.line === f.line) ent.push({ r, e: m, src: 'inter', odds: betterOdds(m.odds, f.odds) });
     });
-    const oHot=(catWL(L,'mit','ou')??.5)>=(catWL(L,'fadey','ou')??.5);
-    const hotId=oHot?'mit':'fadey', hotName=oHot?'Mitts':'Fadey';
-    Object.values(d.rows).forEach(r=>{
-      const e=r.ou?.[hotId];
-      if(e&&!ent.some(x=>x.r.id===r.id)) ent.push({r,e,src:'hot',odds:e.odds});
+    const oHot = (pct('mit', 'ou') ?? .5) >= (pct('fadey', 'ou') ?? .5);
+    const hotId = oHot ? 'mit' : 'fadey', hotName = oHot ? 'Mitts' : 'Fadey';
+    Object.values(d.rows).forEach(r => {
+      const e = r.ou?.[hotId];
+      if (e && !ent.some(x => x.r.id === r.id)) ent.push({ r, e, src: 'hot', odds: e.odds });
     });
-    let placed=0;
-    for(const {r,e,src,odds} of ent){
-      if(placed>=3) break;
-      if(!pitchOK(r.id)) continue;
-      const holdsHit=r.bks&&r.bks.steam!==undefined;
-      if(e.side==='O'&&e.line<1&&holdsHit) continue;
-      r.ou=r.ou||{};
-      r.ou.steam={side:e.side,line:e.line,odds:odds??null,res:null,why:src==='inter'?'both parents on the same side':'from '+hotName+' (better O/U win %)'};
+    let placed = 0;
+    for (const { r, e, src, odds } of ent) {
+      if (placed >= 3) break;
+      if (!pitchOK(r.id)) continue;
+      if (e.side === 'O' && e.line < 1 && holdsHitPick(core, date, 'steam', r.id)) continue;
+      r.ou = r.ou || {};
+      r.ou.steam = { side: e.side, line: e.line, odds: odds ?? null, res: null,
+        why: src === 'inter' ? 'both parents on the same side' : 'from ' + hotName + ' (better O/U win %)' };
       placed++;
     }
-    if(placed) wire(L,'steam',`\u2668 Steam O/U card: ${placed} pick(s)`);
+    if (placed) wire(core, 'steam', 'O/U card filed (' + placed + ' plays).');
   }
 }
 
-// ---------- news wire ----------
-const RISK_WORDS=/(scratch|scratched|out of (the )?lineup|not in (the )?lineup|placed on (the )?(10|15|60)?-?\s?day il|to the il|injured list|day.to.day|left tonight|exit(ed|s)? (the )?game|benched|sitting|getting a day|precautionary|tightness|soreness|sore |strain|sprain|discomfort)/i;
-async function scanNews(rows){
-  const texts=[];
-  const UA={headers:{'User-Agent':'Mozilla/5.0 (hitboard-runner)'}};
-  const FEEDS=[
-    'https://news.google.com/rss/search?q=MLB+(scratched+OR+%22out+of+the+lineup%22+OR+%22placed+on%22+OR+%22injured+list%22)+when:1d&hl=en-US&gl=US&ceid=US:en',
-    'https://news.google.com/rss/search?q=MLB+lineup+today+when:1d&hl=en-US&gl=US&ceid=US:en',
-    'https://www.mlbtraderumors.com/feed',
-    'https://www.mlb.com/feeds/news/rss.xml',
-    'https://www.espn.com/espn/rss/mlb/news',
-    'https://www.rotowire.com/rss/news.php?sport=MLB',
-    'https://www.cbssports.com/rss/headlines/mlb/'
-  ];
-  for(const feed of FEEDS){
-    const t=await T(feed,UA);
-    if(!t){ console.log('feed unavailable:',feed.split('/')[2]); continue; }
-    [...t.matchAll(/<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/title>/g)].forEach(m=>texts.push(m[1]));
-    [...t.matchAll(/<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/description>/g)].slice(0,40).forEach(m=>texts.push(m[1].replace(/<[^>]+>/g,' ').slice(0,300)));
-  }
-  console.log('news items scanned:',texts.length,'from',FEEDS.length,'feeds');
-  // keyword pass: STRICT full-name matching only (word-boundary), so
-  // "Evan Phillips" can never flag "Derek Hill" via the 'hill' substring.
-  const signals=new Map(); // playerId -> reason
-  const nameRe=new Map();
-  for(const r of rows){
-    const first=normName(r.name.split(' ')[0]), lastN=normName(lastName(r.name));
-    if(lastN.length<3) continue;
-    // "mookie betts" OR "m. betts" / "m betts", as whole words
-    nameRe.set(r.id, new RegExp(`\\b(?:${first}|${first[0]}\\.?)[ ]${lastN}\\b`));
-  }
-  for(const tx of texts){
-    if(!RISK_WORDS.test(tx)) continue;
-    const low=normName(tx);
-    for(const r of rows){
-      const re=nameRe.get(r.id);
-      if(re && re.test(low) && !signals.has(r.id)) signals.set(r.id,tx.slice(0,140));
+/* -------- pre-pitch revisions -------------------------------------------- */
+function reviseCards(core, board, date, flags) {
+  const d = core.days?.[date]; if (!d) return;
+  const rowsById = Object.fromEntries(board.rows.map(r => [r.id, r]));
+  const allBooks = ['r5', 'mit', ...BOT_DEFS.map(b => b.id)];
+  for (const bid of allBooks) {
+    for (const row of Object.values(d.rows)) {
+      if (!holdsHitPick(core, date, bid, row.id)) continue;
+      if (row.res != null) continue;
+      const r = rowsById[row.id];
+      const flagged = flags.has(row.id);
+      const scratched = board.hasLineups && r && !r.confirmed;
+      if (!flagged && !scratched) continue;
+      if (!r || started(r)) continue;                 // frozen after first pitch
+      const reason = flagged ? ('news: ' + (flags.get(row.id)?.reason || 'flagged')) : 'missing from the posted lineup';
+      clearHitPick(row, bid);
+      // find replacement: next-best qualifier for this book
+      let repl = null;
+      const okRepl = x => !flags.has(x.id) && !started(x) && (!board.hasLineups || x.confirmed) &&
+        !holdsHitPick(core, date, bid, x.id) && !holdsOUOver05(core, date, bid, x.id);
+      if (bid === 'r5') repl = board.rows.filter(x => x.score != null && okRepl(x)).sort((a, b) => b.score - a.score)[0] || null;
+      else if (bid === 'mit') {
+        const q = board.rows.filter(okRepl).map(x => ({ x, m: mittsEval(x, true, board.hasLineups) }))
+          .filter(y => y.m.ok && (y.m.tier === 'playable' || y.m.tier === 'strong')).sort((a, b) => b.m.edge - a.m.edge)[0];
+        repl = q ? q.x : null;
+      } else {
+        const bot = BOT_DEFS.find(b => b.id === bid);
+        const q = board.rows.filter(okRepl).map(x => ({ x, sc: bot.score(x) })).filter(y => y.sc != null).sort((a, b) => b.sc - a.sc)[0];
+        repl = q ? q.x : null;
+      }
+      if (repl) {
+        setHitPick(core, date, bid, repl, (PICK_WHY[bid] || (() => ''))(repl));
+        wire(core, bid, 'REVISED: out ' + (row.n || row.id) + ' (' + reason + ') → in ' + repl.name + ' (' + fmtOdds(repl.dkOdds) + ').');
+        log('revision:', bid, 'out', row.n, '→', repl.name);
+      } else {
+        wire(core, bid, 'REVISED: pulled ' + (row.n || row.id) + ' (' + reason + ') — no clean replacement, playing short.');
+      }
+    }
+    // drop flagged O/U entries pre-pitch (no forced replacement)
+    for (const row of Object.values(d.rows)) {
+      const e = row.ou?.[bid]; if (!e || e.res != null) continue;
+      const r = rowsById[row.id];
+      const flagged = flags.has(row.id) || (board.hasLineups && r && !r.confirmed);
+      if (flagged && r && !started(r)) {
+        delete row.ou[bid];
+        if (!Object.keys(row.ou).length) delete row.ou;
+        wire(core, bid, 'REVISED: dropped ' + (row.n || row.id) + ' ' + e.side + e.line + ' — out of the lineup.');
+      }
     }
   }
-  // optional Claude comprehension layer: confirm/deny keyword hits
-  if(ANTHROPIC_KEY && signals.size){
-    const items=[...signals.entries()].map(([id,tx])=>({id,name:rows.find(r=>r.id===id)?.name,tx}));
-    const resp=await J('https://api.anthropic.com/v1/messages',{method:'POST',
-      headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
-      body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:400,
-        messages:[{role:'user',content:'For each item, does the text indicate this specific MLB player is OUT, scratched, injured, or not starting TODAY? Reply ONLY JSON array of {"id":number,"out":boolean}. Items: '+JSON.stringify(items)}]})});
-    try{ const arr=JSON.parse((resp?.content?.[0]?.text||'[]').replace(/```json|```/g,''));
-      arr.forEach(x=>{ if(!x.out) signals.delete(x.id); }); console.log('Claude filtered signals to',signals.size);
-    }catch(e){ console.log('Claude parse skipped'); }
+}
+
+/* ============================================================================
+   5. THE MUTANTS — 100-strong autonomous colony (spawn, pick, settle, evolve)
+   Pick format (array — the dashboard viewer indexes into it):
+     [0] 'H' for 1+hit, 'x' otherwise · [1] '' | 'O' | 'U' · [2] line
+     [3] odds · [4] '' | 'w' | 'l' | 'p' · [5] why (string)
+   ========================================================================== */
+const MUT_ADJ = ['Feral', 'Glowing', 'Iron', 'Static', 'Neon', 'Rusted', 'Howling', 'Silent', 'Crimson', 'Vapor', 'Chrome', 'Jagged', 'Molten', 'Frost', 'Grim', 'Lucky', 'Twitchy', 'Patient', 'Greedy', 'Stoic'];
+const MUT_NOUN = ['Mantis', 'Cortex', 'Slugger', 'Optic', 'Vulture', 'Prophet', 'Anvil', 'Cicada', 'Warden', 'Drifter', 'Oracle', 'Piston', 'Specter', 'Badger', 'Reactor', 'Nomad', 'Sentry', 'Magpie', 'Golem', 'Hornet'];
+function rng(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function mkDNA(rand) {
+  const w = { form: rand(), pit: rand(), plat: rand(), bvp: rand(), park: rand() * .6, streak: rand() * .6, xba: rand() * .8, kInv: rand() * .8, price: rand() * .5 };
+  const s = Object.values(w).reduce((a, b) => a + b, 0);
+  Object.keys(w).forEach(k => w[k] = Math.round(w[k] / s * 100) / 100);
+  return { w, n: 2 + Math.floor(rand() * 3), ouBias: Math.round(rand() * 100) / 100, fade: rand() < .22, minScore: 40 + Math.floor(rand() * 20) };
+}
+function dnaDesc(dna) {
+  const tops = Object.entries(dna.w).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, v]) => k + ' ' + v);
+  return 'Hunts ' + (dna.fade ? 'weak profiles to fade Under' : 'live bats') + ' — ' + tops.join(' · ') + (dna.ouBias > .5 ? ' · leans hits O/U' : '') + '.';
+}
+function spawnColony() {
+  const rand = rng(20260401);
+  const roster = {};
+  for (let i = 1; i <= 100; i++) {
+    const id = 'm' + String(i).padStart(3, '0');
+    const name = MUT_ADJ[Math.floor(rand() * MUT_ADJ.length)] + ' ' + MUT_NOUN[Math.floor(rand() * MUT_NOUN.length)] + ' ' + (100 + Math.floor(rand() * 900));
+    const dna = mkDNA(rand);
+    roster[id] = { id, name, dna, locked: false, mergedFrom: null, absorbed: false,
+      rec: { w: 0, l: 0, ow: 0, ol: 0, u: 0, ouU: 0, hist: [] },
+      log: [{ t: Date.now(), note: dnaDesc(dna) }] };
   }
-  return signals;
+  return { mut: { roster, alerts: [{ k: 'admin', t: Date.now(), msg: 'Colony spawned: 100 mutants online, DNA randomized. Evolution begins at first settlement.' }], series: [] }, mdays: {} };
 }
-
-
-// ---------- hits O/U engine (mirror of the dashboard) ----------
-function impliedPct(a){ return a==null?null:(a<0?-a/(-a+100)*100:100/(a+100)*100); }
-const PICK_WHY={
-  r5:r=>'composite '+(r.score??'—'),
-  mit:r=>{const m=mittsEval(r);return m.prob?m.prob.toFixed(0)+'% vs '+(r.dkImplied?.toFixed(0)??'—')+'% (+'+(m.edge?.toFixed(1)??'—')+'%)':'value';},
-  chalky:r=>'K '+(r.st?.k?.toFixed(1)??'low')+'% · hit '+r.l15HitG+'/'+r.l15GwAB,
-  gapper:r=>'xBA '+(r.st?.xba?.toFixed(3)??'—')+' · '+(r.st?.hh?.toFixed(0)??'—')+'% HH',
-  sal:r=>{const o=r.opp||{};const bS=o.hand==='L'?r.avgVsL:r.avgVsR;return (bS?.toFixed(3)??'—')+' vs '+o.hand+'HP';},
-  parkey:r=>'park '+(r.park?.pf??100)+' · '+(r.opp?.h9L5?.toFixed(1)??'—')+' H/9',
-  fadey:r=>(r.dkOdds>0?'+':'')+r.dkOdds+', +'+((r.estP-r.dkImplied)||0).toFixed(1)+'%',
-  streaks:r=>(r.streak??0)+'-game streak',
-  grinder:r=>'BvP '+r.bvpH+'-for-'+r.bvpAB,
-};
-function ouWhy(bid,r,side,c){
-  if(side!=='U') return (PICK_WHY[bid]||PICK_WHY.r5)(r);
-  const M={chalky:()=>'fade '+(r.st?.k?.toFixed(1)??'high')+'% K',gapper:()=>'fade xBA '+(r.st?.xba?.toFixed(3)??'—'),
-    sal:()=>{const o=r.opp||{};const bS=o.hand==='L'?r.avgVsL:r.avgVsR;return 'fade '+(bS?.toFixed(3)??'—')+' vs '+o.hand+'HP';},
-    parkey:()=>'pitcher park '+(r.park?.pf??100),fadey:()=>'+money under, +'+c.eU.toFixed(1)+'%',
-    streaks:()=>'cold '+((c.hitRate*100)|0)+'% hit-rate',grinder:()=>'BvP '+r.bvpH+'-for-'+r.bvpAB,
-    mit:()=>'U edge +'+c.eU.toFixed(1)+'%',r5:()=>'composite '+(r.score??'—')+' bottom tier'};
-  return (M[bid]||M.mit)();
+function mutScore(m, r) {
+  const w = m.dna.w;
+  const feats = {
+    form: r.fForm, pit: r.fPit, plat: r.fPlat, bvp: r.fBvp,
+    park: scale(r.park?.pf, 94, 112),
+    streak: scale(r.streak, 0, 10),
+    xba: scale(r.st?.xba, .22, .30),
+    kInv: r.st?.k != null ? 100 - scale(r.st.k, 12, 30) : null,
+    price: r.dkOdds != null ? scale(r.dkOdds, -260, 140) : null
+  };
+  let s = 0, wsum = 0;
+  for (const [k, v] of Object.entries(feats)) if (v != null && w[k]) { s += v * w[k]; wsum += w[k]; }
+  return wsum > 0 ? s / wsum : null;
 }
-function ouContext(r){
-  if(r.ouLine==null||r.ouOver==null||r.ouUnder==null||r.estP==null) return null;
-  const n=r.expAB||3.8, p=1-Math.pow(1-r.estP/100,1/n);
-  const p1=r.estP/100, p2=1-Math.pow(1-p,n)-n*p*Math.pow(1-p,n-1);
-  const pOver=r.ouLine<1?p1:p2;
-  return {pOver, eO:pOver*100-impliedPct(r.ouOver), eU:(1-pOver)*100-impliedPct(r.ouUnder),
-          hitRate:r.l15GwAB>0?r.l15HitG/r.l15GwAB:0};
-}
-const OU_AFFINITY={
-  r5:(r,c)=>r.score!=null&&r.score>=62?{side:'O',w:r.score+c.eO*2}:r.score!=null&&r.score<=35?{side:'U',w:(100-r.score)+c.eU*2}:null,
-  mit:(r,c)=>{const e=Math.max(c.eO,c.eU); return e>=5?{side:c.eO>=c.eU?'O':'U',w:e*10}:null;},
-  chalky:(r,c)=>{const k=r.st?.k; if(k==null)return null;
-    if(k<=20&&c.hitRate>=.6)return{side:'O',w:(24-k)*4+c.eO*3};
-    if(k>=26&&(r.fPit??50)<=45)return{side:'U',w:k*2.5+c.eU*3}; return null;},
-  gapper:(r,c)=>{const x=r.st?.xba; if(x==null)return null;
-    if(x>=.27)return{side:'O',w:x*300+c.eO*3};
-    if(x<=.225&&(r.opp?.xba??.3)<=.235)return{side:'U',w:(240-x*1000)+c.eU*3}; return null;},
-  sal:(r,c)=>{const o=r.opp||{}; if(!o.hand||o.hand==='?')return null;
-    const bS=o.hand==='L'?r.avgVsL:r.avgVsR; if(bS==null)return null;
-    if(bS>=.29)return{side:'O',w:bS*500+c.eO*2};
-    if(bS<=.21)return{side:'U',w:(300-bS*1000)+c.eU*2}; return null;},
-  parkey:(r,c)=>{const pf=r.park?.pf??100;
-    if(pf>=104)return{side:'O',w:(pf-100)*8+c.eO*2};
-    if(pf<=96)return{side:'U',w:(100-pf)*8+c.eU*2}; return null;},
-  fadey:(r,c)=>{ if(r.ouOver>=100&&c.eO>=3)return{side:'O',w:r.ouOver+c.eO*10};
-    if(r.ouUnder>=100&&c.eU>=3)return{side:'U',w:r.ouUnder+c.eU*10}; return null;},
-  streaks:(r,c)=>{ if((r.streak??0)>=5)return{side:'O',w:r.streak*10+c.eO*2};
-    if(c.hitRate<=.4&&(r.streak??0)===0)return{side:'U',w:(60-c.hitRate*100)+c.eU*2}; return null;},
-  grinder:(r,c)=>{if((r.bvpPA??0)<12)return null;
-    if(r.bvpAvg>=.33)return{side:'O',w:r.bvpAvg*300+c.eO*2};
-    if(r.bvpAvg<=.18)return{side:'U',w:(120-r.bvpAvg*300)+c.eU*2}; return null;},
-};
-function holdsOUOver05(L,dt,bid,id){
-  const e=L.days[dt]?.rows[id]?.ou?.[bid];
-  return !!(e && e.side==='O' && e.line<1);
-}
-function hasOU(L,dt,bid){ const d=L.days[dt]; return !!d&&Object.values(d.rows).some(r=>r.ou&&r.ou[bid]); }
-function fileOU(L,dt,rows,now,pitchTime){
-  for(const [bid,aff] of Object.entries(OU_AFFINITY)){
-    if(hasOU(L,dt,bid)) continue;
-    const cands=[];
-    for(const r of rows){
-      if(pitchTime(r)<=now) continue;
-      const c=ouContext(r); if(!c) continue;
-      const a=aff(r,c); if(!a) continue;
-      if(a.side==='O' && r.ouLine<1 && hasPick(L,dt,bid,r.id)) continue; // same bet as hit card
-      cands.push({r,side:a.side,line:r.ouLine,odds:a.side==='O'?r.ouOver:r.ouUnder,w:a.w,why:ouWhy(bid,r,a.side,c)});
+function mutantsFile(colony, core, board, date) {
+  colony.mdays = colony.mdays || {};
+  const md = colony.mdays[date] || (colony.mdays[date] = { rows: {} });
+  if (Object.keys(md.rows).length) return 0; // already filed today
+  const priced = board.rows.some(r => r.dkOdds != null);
+  if (!priced && !board.hasLineups) return 0; // file once the day's board is priced/lined
+  const rand = rng(parseInt(date.replace(/-/g, ''), 10));
+  let filed = 0;
+  const act = Object.values(colony.mut.roster).filter(m => !m.absorbed);
+  for (const m of act) {
+    const scored = board.rows.filter(r => !started(r)).map(r => ({ r, s: mutScore(m, r) })).filter(x => x.s != null);
+    if (!scored.length) continue;
+    scored.sort((a, b) => b.s - a.s);
+    const picks = [];
+    if (m.dna.fade) {
+      // fade mutants take Unders on the weakest profiles with two-way prices
+      const weak = scored.slice().reverse().filter(x => x.r.ouLine != null && x.r.ouUnder != null).slice(0, m.dna.n);
+      weak.forEach(x => picks.push({ r: x.r, pk: ['x', 'U', x.r.ouLine, x.r.ouUnder, '', 'fade: profile score ' + x.s.toFixed(0)] }));
+    } else {
+      for (const x of scored) {
+        if (picks.length >= m.dna.n) break;
+        if (x.s < m.dna.minScore) break;
+        const r = x.r;
+        const takeOU = r.ouLine != null && r.ouOver != null &&
+          (rand() < m.dna.ouBias || (r.ouLine < 1 && r.dkOdds != null && r.ouOver > r.dkOdds)); // better-price rule applies here too
+        if (takeOU) picks.push({ r, pk: ['x', 'O', r.ouLine, r.ouOver, '', 'score ' + x.s.toFixed(0) + (r.dkOdds != null && r.ouOver > r.dkOdds ? ' · better O/U price' : '')] });
+        else picks.push({ r, pk: ['H', '', 0.5, r.dkOdds ?? null, '', 'score ' + x.s.toFixed(0)] });
+      }
     }
-    const overs=cands.filter(x=>x.side==='O').sort((a,b)=>b.w-a.w);
-    const unders=cands.filter(x=>x.side==='U').sort((a,b)=>b.w-a.w);
-    let picks=[...overs.slice(0,2),...unders.slice(0,1)];
-    if(picks.length<3) picks=picks.concat((unders.length>1?unders.slice(1):overs.slice(2)).slice(0,3-picks.length));
-    picks=picks.slice(0,3);
-    if(picks.length<3){ console.log(NAMES[bid]+' O/U: passes'); continue; }
-    picks.forEach(p=>{ record(L,dt,p.r); const row=L.days[dt].rows[p.r.id];
-      row.ou=row.ou||{}; row.ou[bid]={side:p.side,line:p.line,odds:p.odds,res:null,why:p.why||null}; });
-    wire(L,bid,`${NAMES[bid]} O/U card: ${picks.map(p=>`${p.r.name} ${p.side}${p.line}`).join(', ')}`);
+    for (const { r, pk } of picks) {
+      const row = md.rows[r.id] || (md.rows[r.id] = { n: r.name, t: r.team, op: r.opp?.name || '', od: r.dkOdds ?? null, ouL: r.ouLine ?? null, mk: {} });
+      row.mk[m.id] = pk;
+      filed++;
+    }
   }
+  if (filed) {
+    colony.mut.alerts.push({ k: 'admin', t: Date.now(), msg: date + ': colony filed — ' + filed + ' picks across ' + Object.keys(md.rows).length + ' hitters (' + act.length + ' mutants active).' });
+    log('MUTANTS:', act.length, 'of 100 filed —', filed, 'picks on', Object.keys(md.rows).length, 'hitters');
+  }
+  return filed;
 }
-
-// ---------- picks, revisions, settlement ----------
-function day(L,dt){ return L.days[dt]=L.days[dt]||{rows:{}}; }
-function record(L,dt,r){ const d=day(L,dt); const prev=d.rows[r.id]||{};
-  d.rows[r.id]={id:r.id,n:r.name,t:r.team,g:r.game,rk:r.rank??prev.rk,gp:r.gamePk??prev.gp??null,
-    sc:r.score,ep:r.estP!=null?Math.round(r.estP*10)/10:null,od:r.dkOdds??prev.od??null,op:r.opp?.name||'',
-    picked:prev.picked||false,pickOdds:prev.pickOdds??null,bot:prev.bot||false,botOdds:prev.botOdds??null,
-    mit:prev.mit||false,mitOdds:prev.mitOdds??null,bks:prev.bks,ou:prev.ou,why:prev.why,res:prev.res??null}; }
-function setPick(L,dt,botId,r){ const d=day(L,dt); record(L,dt,r); const row=d.rows[r.id];
-  try{ row.why=row.why||{}; row.why[botId]=(PICK_WHY[botId]||PICK_WHY.r5)(r); }catch(e){}
-  if(botId==='r5'){row.bot=true;row.botOdds=r.dkOdds??row.od??null;}
-  else if(botId==='mit'){row.mit=true;row.mitOdds=r.dkOdds??row.od??null;}
-  else{row.bks=row.bks||{};row.bks[botId]=r.dkOdds??row.od??null;} }
-function unpick(L,dt,botId,id){ const row=L.days[dt]?.rows[id]; if(!row)return;
-  if(botId==='r5')row.bot=false; else if(botId==='mit')row.mit=false; else if(row.bks)delete row.bks[botId]; }
-function hasPick(L,dt,botId,id){ const row=L.days[dt]?.rows[id]; if(!row)return false;
-  return botId==='r5'?row.bot:botId==='mit'?row.mit:!!(row.bks&&row.bks[botId]!==undefined); }
-function currentPicks(L,dt,botId){ const d=L.days[dt]; if(!d)return[];
-  return Object.values(d.rows).filter(row=>hasPick(L,dt,botId,row.id)).map(r=>r.id); }
-
-async function settle(L){
-  const today=todayISO();
-  // union: main-ledger pending dates PLUS colony days awaiting settlement —
-  // so the mutants always grade even if the dashboard settled the bots first
-  const dates=[...new Set([
-    ...Object.keys(L.days).filter(dt=>dt<today&&Object.values(L.days[dt].rows).some(r=>r.res==null||r.res==='dnp')),
-    ...Object.keys(L.mdays||{}).filter(dt=>dt<today&&!L.mdays[dt].settled)
-  ])].sort().slice(-10);
-  for(const dt of dates){
-    const hits={};
-    for(let off=0;off<3000;off+=1000){
-      const d=await J(`${API}/stats?stats=byDateRange&group=hitting&season=${dt.slice(0,4)}&startDate=${dt}&endDate=${dt}&playerPool=ALL&limit=1000&offset=${off}`);
-      const sp=d?.stats?.[0]?.splits||[]; sp.forEach(x=>{if(x.player&&(x.stat.plateAppearances||0)>0)hits[x.player.id]=(hits[x.player.id]||0)+(x.stat.hits||0);});
-      if(sp.length<1000)break;
-    }
-    if(Object.keys(hits).length<20){ console.log('skip settle',dt,'thin data'); continue; }
-    let n=0;
-    Object.values(L.days[dt].rows).forEach(r=>{
-      if(r.res==='win'||r.res==='loss')return;
-      const h=hits[r.id];
-      if(h==null){ if(r.res==null){r.res='dnp';n++;} return; }
-      const nr=h>=1?'win':'loss'; if(r.res!==nr){r.res=nr;n++;}
-    });
-    mutInit(L); mutantsSettle(L, dt, hits);
-    Object.values(L.days[dt].rows).forEach(r=>{
-      if(!r.ou) return; const h=hits[r.id];
-      Object.values(r.ou).forEach(e=>{
-        if(e.res==='win'||e.res==='loss') return;
-        if(h==null){ e.res='dnp'; return; }
-        e.res=(e.side==='O'?h>e.line:h<e.line)?'win':'loss'; n++;
+function mutantsSettle(colony, hitsCache) {
+  const today = todayISO();
+  const roster = colony.mut.roster;
+  const dates = Object.keys(colony.mdays || {}).filter(dt => dt < today).sort();
+  let settledDays = 0;
+  return (async () => {
+    for (const dt of dates) {
+      const md = colony.mdays[dt];
+      const open = Object.values(md.rows).some(row => Object.values(row.mk).some(pk => !pk[4]));
+      if (!open) continue;
+      const hitsById = hitsCache[dt] || (hitsCache[dt] = await hitsForDate(dt));
+      if (Object.keys(hitsById).length < 20) { log('mutants: no results yet for', dt); continue; }
+      const dayU = {}; // per-mutant units that day
+      for (const [pid, row] of Object.entries(md.rows)) {
+        const h = hitsById[pid];
+        for (const [mid, pk] of Object.entries(row.mk)) {
+          if (pk[4]) continue;
+          const m = roster[mid]; if (!m) { pk[4] = 'p'; continue; }
+          let res;
+          if (h == null) res = 'p';                              // DNP = push
+          else if (pk[0] === 'H') res = h >= 1 ? 'w' : 'l';
+          else res = (pk[1] === 'O' ? h > pk[2] : h < pk[2]) ? 'w' : 'l';
+          pk[4] = res;
+          const u = res === 'p' ? 0 : unitsFor(res === 'w' ? 'win' : 'loss', pk[3]);
+          if (pk[0] === 'H') { if (res === 'w') m.rec.w++; else if (res === 'l') m.rec.l++; m.rec.u = Math.round((m.rec.u + u) * 100) / 100; }
+          else { if (res === 'w') m.rec.ow++; else if (res === 'l') m.rec.ol++; m.rec.ouU = Math.round((m.rec.ouU + u) * 100) / 100; }
+          dayU[mid] = (dayU[mid] || 0) + u;
+        }
+      }
+      let colonyDay = 0;
+      Object.entries(dayU).forEach(([mid, u]) => {
+        const m = roster[mid]; if (!m) return;
+        m.rec.hist.push({ d: dt, u: Math.round(u * 100) / 100 });
+        m.rec.hist = m.rec.hist.slice(-45);
+        colonyDay += u;
       });
-    });
-    console.log('settled',n,'rows for',dt);
+      colony.mut.series = colony.mut.series || [];
+      if (!colony.mut.series.some(x => x.d === dt))
+        colony.mut.series.push({ d: dt, u: Math.round(colonyDay * 100) / 100 });
+      settledDays++;
+      log('mutants settled', dt, '· colony', (colonyDay >= 0 ? '+' : '') + colonyDay.toFixed(1) + 'u');
+      evolveColony(colony, dt);
+    }
+    // prune old mdays to keep the bin lean (standings live in rec/series)
+    const keep = Object.keys(colony.mdays).sort().slice(-14);
+    const pruned = {}; keep.forEach(dt => pruned[dt] = colony.mdays[dt]);
+    colony.mdays = pruned;
+    colony.mut.alerts = (colony.mut.alerts || []).slice(-40);
+    return settledDays;
+  })();
+}
+function evolveColony(colony, dt) {
+  const roster = colony.mut.roster;
+  const act = Object.values(roster).filter(m => !m.absorbed);
+  const units = m => (m.rec.u || 0) + (m.rec.ouU || 0);
+  // hot-streak locks
+  for (const m of act) {
+    const l5 = m.rec.hist.slice(-5).reduce((s, x) => s + x.u, 0);
+    if (!m.locked && m.rec.hist.length >= 5 && l5 >= 4) {
+      m.locked = true;
+      m.log.push({ t: Date.now(), note: 'LOCKED strategy after +' + l5.toFixed(1) + 'u over 5 settled days. ' + dnaDesc(m.dna) });
+      colony.mut.alerts.push({ k: 'lock', t: Date.now(), msg: m.name + ' locked its strategy — +' + l5.toFixed(1) + 'u over the last 5 settled days.' });
+    }
+  }
+  // daily hot alert
+  const best = act.map(m => ({ m, u: m.rec.hist.find(h => h.d === dt)?.u ?? 0 })).sort((a, b) => b.u - a.u)[0];
+  if (best && best.u >= 2.5)
+    colony.mut.alerts.push({ k: 'hot', t: Date.now(), msg: best.m.name + ' ran hot on ' + dt + ': +' + best.u.toFixed(1) + 'u on the day.' });
+  // merges: chronic losers get absorbed into fusions with a top performer
+  const decided = m => m.rec.w + m.rec.l + m.rec.ow + m.rec.ol;
+  const losers = act.filter(m => !m.locked && decided(m) >= 15 && units(m) <= -8).sort((a, b) => units(a) - units(b)).slice(0, 3);
+  const tops = act.filter(m => units(m) > 0).sort((a, b) => units(b) - units(a));
+  const rand = rng(parseInt(dt.replace(/-/g, ''), 10) ^ 0xBEEF);
+  for (const loser of losers) {
+    const top = tops[Math.floor(rand() * Math.min(5, tops.length))];
+    if (!top) break;
+    loser.absorbed = true;
+    const nid = 'f' + String(Object.keys(roster).length + 1).padStart(3, '0');
+    const w = {}; Object.keys(top.dna.w).forEach(k => w[k] = Math.round(((top.dna.w[k] * .7 + loser.dna.w[k] * .3)) * 100) / 100);
+    const dna = { ...top.dna, w, n: Math.max(2, Math.round((top.dna.n + loser.dna.n) / 2)) };
+    roster[nid] = { id: nid, name: top.name.split(' ')[0] + '-' + loser.name.split(' ')[1] + ' Fusion', dna,
+      locked: false, mergedFrom: [top.id, loser.id], absorbed: false,
+      rec: { w: 0, l: 0, ow: 0, ol: 0, u: 0, ouU: 0, hist: [] },
+      log: [{ t: Date.now(), note: 'Fused from ' + top.name + ' × ' + loser.name + '. ' + dnaDesc(dna) }] };
+    colony.mut.alerts.push({ k: 'merge', t: Date.now(), msg: loser.name + ' (' + units(loser).toFixed(1) + 'u) was absorbed — genome fused with ' + top.name + ' → ' + roster[nid].name + '.' });
+    log('🧬 merge:', loser.name, '→', roster[nid].name);
   }
 }
 
-// ================= THE MUTANTS — a 100-bot evolutionary colony =================
-// Deterministic genetic strategy search over the same board data the squad uses.
-// Each mutant = a genome: feature weights + filters + bet-type preferences.
-// Daily lifecycle: pick → settle → evolve (learn from peers, merge, lock, unfuse).
-// Everything is seeded & auditable; every change is logged with a rationale.
-function mulberry32(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
-function seedFrom(str){ let h=0; for(const c of str) h=Math.imul(31,h)+c.charCodeAt(0)|0; return h; }
+/* ============================================================================
+   MAIN
+   ========================================================================== */
+(async () => {
+  const t0 = Date.now();
+  const date = todayISO();
+  log('=== HIT BOARD RUNNER ===', date);
 
-const MUT_PRE=['Glitch','Vex','Nova','Krank','Byte','Fizz','Mook','Zap','Drift','Hex'];
-const MUT_SUF=['tron','ide','us','by','mo','zilla','nik','form','ling','ex'];
-function mutName(i){ return MUT_PRE[i%10]+MUT_SUF[Math.floor(i/10)%10]; }
+  /* --- load core bin --- */
+  let core = await binRead(JSONBIN_BIN);
+  if (!core || typeof core !== 'object') core = {};
+  core.version = core.version || 1;
+  core.days = core.days || {};
+  const remoteSnapshot = JSON.parse(JSON.stringify(core.days)); // for merge-safe write later
 
-const GENE_KEYS=['form','hr','stk','k','xba','hh','plat','bvp','park','h9','edge','prob'];
-function randGenome(rng){
-  const w={}; GENE_KEYS.forEach(k=>w[k]=Math.round(rng()*100)/100);
-  return { w,
-    f:{ minHR:.35+rng()*.25, maxK:20+rng()*12, minProb:52+rng()*12, conf:rng()<.5 },
-    bt:{ hit:rng() },                       // probability mass on 1+hit vs O/U betting
-    ouLo:25+rng()*15, ouHi:60+rng()*20,     // score thresholds for Under / Over
-    n:2+Math.floor(rng()*2) };
-}
-function mutFeatures(r){
-  const o=r.opp||{}, st=r.st||{};
-  const bS=o.hand==='L'?r.avgVsL:r.avgVsR;
-  return {
-    form: scale(r.l15Avg,.18,.34)??50,
-    hr:  (r.l15GwAB>0? r.l15HitG/r.l15GwAB*100 : 50),
-    stk: Math.min((r.streak??0)*12,100),
-    k:   st.k!=null? 100-scale(st.k,14,32) : 50,
-    xba: st.xba!=null? scale(st.xba,.21,.30) : 50,
-    hh:  st.hh!=null? scale(st.hh,28,50) : 50,
-    plat:bS!=null? scale(bS,.18,.34) : 50,
-    bvp: (r.bvpPA>=8&&r.bvpAvg!=null)? scale(r.bvpAvg,.15,.40) : 50,
-    park:scale(r.park?.pf??100,92,112)??50,
-    h9:  o.h9L5!=null? scale(o.h9L5,6.5,12.5) : 50,
-    edge:r.edge!=null? clamp(50+r.edge*4,0,100) : 50,
-    prob:r.estP!=null? scale(r.estP,45,80) : 50 };
-}
-function mutScore(g,r){
-  const f=mutFeatures(r); let s=0,wsum=0;
-  GENE_KEYS.forEach(k=>{ s+=f[k]*g.w[k]; wsum+=g.w[k]; });
-  return wsum>0? s/wsum : 0;
-}
-function genomeSim(a,b){
-  let dot=0,na=0,nb=0;
-  GENE_KEYS.forEach(k=>{ dot+=a.w[k]*b.w[k]; na+=a.w[k]**2; nb+=b.w[k]**2; });
-  return dot/Math.sqrt(na*nb||1);
-}
-function describeGenome(g){
-  const top=[...GENE_KEYS].sort((x,y)=>g.w[y]-g.w[x]).slice(0,3);
-  const L={form:'recent form',hr:'hit-game consistency',stk:'streak momentum',k:'contact (low-K)',xba:'batted-ball quality',hh:'hard contact',plat:'platoon edges',bvp:'BvP history',park:'park environment',h9:'leaky pitchers',edge:'market mispricing',prob:'raw hit probability'};
-  const bt=g.bt.hit>=.66?'mostly 1+hit bets':g.bt.hit<=.33?'mostly O/U bets':'a mix of 1+hit and O/U';
-  return `Hunts ${L[top[0]]}, ${L[top[1]]} and ${L[top[2]]}; plays ${bt}, ${g.n} picks; needs ${(g.f.minHR*100).toFixed(0)}%+ hit-rate, K% under ${g.f.maxK.toFixed(0)}${g.f.conf?', confirmed lineups only':''}.`;
-}
-
-function mutInit(L){
-  if(L._mutLoadFailed) return;
-  if(L.mut && L.mut.roster) return;
-  const rng=mulberry32(20260706);
-  const roster={};
-  for(let i=0;i<100;i++){
-    const id='M'+String(i+1).padStart(3,'0');
-    roster[id]={ id, name:mutName(i), g:randGenome(rng),
-      rec:{w:0,l:0,u:0,ow:0,ol:0,ouU:0,cs:0,cl:0,hist:[]},
-      locked:false, absorbed:null, mergedFrom:null, log:[{d:'genesis',note:'Spawned with a random genome. '+'Ready to evolve.'}] };
+  /* --- load / create colony bin --- */
+  let colonyBinId = core.mutBinId || null;
+  let colony = null;
+  if (colonyBinId) {
+    try { colony = await binRead(colonyBinId); } catch (e) { log('colony bin unreadable:', e.message); colony = null; }
   }
-  L.mut={roster, alerts:[], series:[], evoDone:{}};
-  console.log('MUTANTS: colony of 100 spawned');
-}
-function mutAlert(L,k,msg){ L.mut.alerts.push({t:Date.now(),k,msg}); L.mut.alerts=L.mut.alerts.slice(-40); console.log('[mutant-alert:'+k+'] '+msg); }
-function activeMutants(L){ return Object.values(L.mut.roster).filter(m=>!m.absorbed); }
+  if (!colony || !colony.mut || !colony.mut.roster || !Object.keys(colony.mut.roster).length) {
+    log('spawning fresh 100-mutant colony…');
+    colony = spawnColony();
+    if (!colonyBinId) { colonyBinId = await binCreate('hit-board-colony', colony); core.mutBinId = colonyBinId; log('colony bin created:', colonyBinId); }
+  }
+  colony.mut.roster = colony.mut.roster || {};
+  colony.mut.alerts = colony.mut.alerts || [];
+  colony.mut.series = colony.mut.series || [];
+  colony.mdays = colony.mdays || {};
 
-function mutWhy(g,r){
-  const f=mutFeatures(r);
-  const top=GENE_KEYS.map(k=>[k,f[k]*g.w[k]]).sort((a,b)=>b[1]-a[1]).slice(0,2).map(x=>x[0]);
-  const V={form:('L15 '+(r.l15Avg?.toFixed(3)??'')),hr:('hit-rate '+((r.l15GwAB?r.l15HitG/r.l15GwAB*100:0)|0)+'%'),stk:(r.streak+'-gm streak'),k:('K '+(r.st?.k?.toFixed(0)??'?')+'%'),xba:('xBA '+(r.st?.xba?.toFixed(3)??'?')),hh:((r.st?.hh?.toFixed(0)??'?')+'% HH'),plat:'platoon edge',bvp:('BvP '+(r.bvpH??0)+'/'+(r.bvpAB??0)),park:('park '+(r.park?.pf??100)),h9:((r.opp?.h9L5?.toFixed(1)??'?')+' H/9'),edge:('edge '+(r.edge?.toFixed(1)??'?')+'%'),prob:('est '+(r.estP?.toFixed(0)??'?')+'%')};
-  return top.map(k=>V[k]).join(' · ');
-}
-function mutantsPick(L, date, rows, now, pitchTime){
-  if(L._mutLoadFailed) return;
-  mutInit(L);
-  L.mdays=L.mdays||{};
-  if(L.mdays[date] && L.mdays[date].filed) return;
-  const avail=rows.filter(r=>pitchTime(r)>now);
-  if(!avail.length) return;
-  const priced=avail.filter(r=>r.dkOdds!=null);
-  if(priced.length<20) { console.log('MUTANTS: waiting for a priced board'); return; }
-  const md=L.mdays[date]=L.mdays[date]||{rows:{},filed:false};
-  const rng=mulberry32(seedFrom(date)^99);
-  let filed=0;
-  for(const m of activeMutants(L)){
-    const g=m.g;
-    const pool=avail.filter(r=>{
-      const hrOK=(r.l15GwAB>0? r.l15HitG/r.l15GwAB : 0)>=g.f.minHR;
-      const kOK=(r.st?.k??24)<=g.f.maxK;
-      const pOK=(r.estP??0)>=g.f.minProb;
-      return hrOK&&kOK&&pOK&&(!g.f.conf||r.confirmed);
-    });
-    const scored=pool.map(r=>({r,sc:mutScore(g,r)})).sort((a,b)=>b.sc-a.sc);
-    // the anti-pool: players this mutant's own filters REJECTED — its fade material
-    const poolIds=new Set(pool.map(r=>r.id));
-    const fades=avail.filter(r=>!poolIds.has(r.id)&&r.ouLine!=null&&r.ouOver!=null&&r.ouUnder!=null)
-      .map(r=>({r,sc:mutScore(g,r)})).sort((a,b)=>a.sc-b.sc);   // worst first
-    const cap=Math.min(g.n,3);
-    // how many Under slots this genome wants: OU-heavy genomes fade more
-    const uSlots=g.bt.hit<=.33?2:g.bt.hit<.8?1:0;
-    let placed=0;
-    const place=(r,pk)=>{ const row=md.rows[r.id]=md.rows[r.id]||{n:r.name,t:r.team,op:r.opp?.name||'',od:r.dkOdds??null,ouL:r.ouLine??null,ouO:r.ouOver??null,ouU:r.ouUnder??null,res:null,mk:{}};
-      if(row.mk[m.id]) return false; row.mk[m.id]=pk; placed++; return true; };
-    for(const {r} of scored){
-      if(placed>=cap-Math.min(uSlots,fades.length?uSlots:0)) break;
-      const wantHit=rng()<g.bt.hit;
-      if(wantHit && r.dkOdds!=null) place(r,['H',null,r.dkOdds,null,null,mutWhy(g,r)]);
-      else if(r.ouLine!=null&&r.ouOver!=null) place(r,['OU','O',r.ouOver,r.ouLine,null,mutWhy(g,r)]);
-    }
-    for(const {r} of fades){
-      if(placed>=cap) break;
-      const hr=r.l15GwAB>0?r.l15HitG/r.l15GwAB:0; const fails=[];
-      if(hr<g.f.minHR) fails.push('hit-rate '+((hr*100)|0)+'%<'+((g.f.minHR*100)|0)+'%');
-      if((r.st?.k??24)>g.f.maxK) fails.push('K '+(r.st?.k?.toFixed(0)??'?')+'%>'+g.f.maxK.toFixed(0));
-      if((r.estP??0)<g.f.minProb) fails.push('est '+(r.estP?.toFixed(0)??'?')+'%<'+g.f.minProb.toFixed(0));
-      place(r,['OU','U',r.ouUnder,r.ouLine,null,'fade: '+(fails.join(', ')||'below my bar')]);
-    }
-    // top up with overs if fades were scarce
-    for(const {r} of scored){ if(placed>=cap) break;
-      if(r.ouLine!=null&&r.ouOver!=null) place(r,['OU','O',r.ouOver,r.ouLine,null,mutWhy(g,r)]); }
-    if(placed) filed++;
-  }
-  md.filed=true;
-  console.log('MUTANTS:',filed,'of',activeMutants(L).length,'filed for',date);
-  // trim old detail days to keep the bin small
-  Object.keys(L.mdays).sort().slice(0,-7).forEach(d=>delete L.mdays[d]);
-}
+  /* --- 1. settle ledger + mutants (shared results cache) --- */
+  const hitsCache = {};
+  await settle(core, hitsCache);
+  await mutantsSettle(colony, hitsCache);
 
-function mutantsSettle(L, dt, hits){
-  if(L._mutLoadFailed) return;
-  const md=L.mdays?.[dt]; if(!md||md.settled) return;
-  const dayU={};
-  Object.entries(md.rows).forEach(([pid,row])=>{
-    const h=hits[pid];
-    Object.entries(row.mk).forEach(([mid,pk])=>{
-      if(pk[4]!=null) return; // already graded
-      let res;
-      if(h==null) res='p';
-      else if(pk[0]==='H') res=h>=1?'w':'l';
-      else res=((pk[1]==='O'? h>pk[3] : h<pk[3]))?'w':'l';
-      pk[4]=res;
-      const m=L.mut.roster[mid]; if(!m) return;
-      const odds=pk[2];
-      const u=res==='w'?(odds!=null?(odds>0?odds/100:100/-odds):0.4):res==='l'?-1:0;
-      dayU[mid]=(dayU[mid]||0)+u;
-      if(pk[0]==='H'){ if(res==='w')m.rec.w++; else if(res==='l')m.rec.l++; if(res!=='p')m.rec.u+=u; }
-      else { if(res==='w')m.rec.ow++; else if(res==='l')m.rec.ol++; if(res!=='p')m.rec.ouU+=u; }
-    });
-  });
-  Object.entries(dayU).forEach(([mid,u])=>{
-    const m=L.mut.roster[mid]; if(!m) return;
-    m.rec.hist.push({d:dt,u:Math.round(u*100)/100}); m.rec.hist=m.rec.hist.slice(-21);
-    if(u>0){ m.rec.cs++; m.rec.cl=0; } else if(u<0){ m.rec.cl++; m.rec.cs=0; }
-    // user rule: strategy change + 2 consecutive profitable days = front-page alert
-    if(m.chgAt && m.rec.cs>=2){
-      mutAlert(L,'hot',`🔥 ${m.name} retooled its strategy on ${m.chgAt} and just posted ${m.rec.cs} straight profitable days (+${m.rec.hist.slice(-m.rec.cs).reduce((s,x)=>s+x.u,0).toFixed(1)}u). The tweak is working.`);
-      m.chgAt=null;
+  /* --- 2. today's board (full rebuild at most every 3h; cheap refresh otherwise) --- */
+  let board = null;
+  const meta = core.boardMeta || {};
+  const needRebuild = meta.date !== date || !meta.builtAt || (Date.now() - meta.builtAt) > 3 * 3600 * 1000 || !core.boardCache?.rows?.length;
+  if (needRebuild) {
+    board = await buildBoard(core, date);
+    if (board) {
+      core.boardMeta = { date, builtAt: Date.now() };
+      core.boardCache = { rows: board.rows, hasLineups: board.hasLineups };
     }
-  });
-  const colonyU=Object.values(dayU).reduce((s,u)=>s+u,0);
-  L.mut.series.push({d:dt,u:Math.round(colonyU*10)/10}); L.mut.series=L.mut.series.slice(-200);
-  md.settled=true;
-  console.log('MUTANTS: settled',dt,'colony day units',colonyU.toFixed(1));
-}
+  } else {
+    board = { rows: core.boardCache.rows, hasLineups: core.boardCache.hasLineups };
+    board = await refreshBoardLive(board, date);
+    core.boardCache = { rows: board.rows, hasLineups: board.hasLineups };
+    log('board refreshed from cache (' + board.rows.length + ' hitters) — lineups:', board.hasLineups ? 'posted' : 'not yet');
+  }
 
-function fitness(m){ return m.rec.hist.slice(-7).reduce((s,x)=>s+x.u,0); }
-function mutantsEvolve(L, dt){
-  if(L._mutLoadFailed) return;
-  if(L.mut.evoDone[dt]) return;
-  const act=activeMutants(L).filter(m=>m.rec.hist.length>=2);
-  if(act.length<10){ L.mut.evoDone[dt]=true; return; }
-  const rng=mulberry32(seedFrom(dt)^7);
-  const ranked=[...act].sort((a,b)=>fitness(b)-fitness(a));
-  const top=ranked.slice(0,Math.max(5,Math.floor(ranked.length*.1)));
-  // LOCK: 5 straight profitable days = strategy found, frozen forever
-  for(const m of act){
-    if(!m.locked && m.rec.cs>=5){
-      m.locked=true;
-      m.log.push({d:dt,note:'LOCKED IN. Five consecutive profitable days — this genome no longer changes. '+describeGenome(m.g)});
-      mutAlert(L,'lock',`🔒 ${m.name} has locked its strategy after 5 straight green days (${uNum(fitness(m))} last 7). It will never change again.`);
-    }
-  }
-  // LEARN: strugglers study a top performer and shift toward its genome
-  const strugglers=ranked.slice(Math.floor(ranked.length*.6)).filter(m=>!m.locked);
-  for(const m of strugglers){
-    if(rng()>.3) continue;
-    const mentor=top[Math.floor(rng()*top.length)];
-    GENE_KEYS.forEach(k=>{ m.g.w[k]=Math.round((m.g.w[k]*.7+mentor.g.w[k]*.3+(rng()-.5)*.1)*100)/100; });
-    if(rng()<.4) m.g.f.minHR=clamp(m.g.f.minHR+(rng()-.5)*.06,.3,.65);
-    if(rng()<.4) m.g.bt.hit=clamp(m.g.bt.hit*.7+mentor.g.bt.hit*.3+(rng()-.5)*.1,0,1);
-    if(rng()<.4) m.g.f.minProb=clamp(m.g.f.minProb+(rng()-.5)*3,50,70);
-    m.chgAt=dt; m.rec.cs=0;
-    m.log.push({d:dt,note:`Studied ${mentor.name}'s approach (7-day ${uNum(fitness(mentor))}) and shifted 30% toward its weighting. New identity: ${describeGenome(m.g)}`});
-    m.log=m.log.slice(-4);
-  }
-  // MERGE: two complementary top performers fuse (max 1 per day)
-  const cands=ranked.slice(0,Math.floor(ranked.length*.3)).filter(m=>!m.locked&&!m.mergedFrom);
-  outer:
-  for(let i=0;i<cands.length&&rng()<.4;i++){
-    for(let j=i+1;j<cands.length;j++){
-      const a=cands[i],b=cands[j];
-      if(genomeSim(a.g,b.g)<.55){
-        GENE_KEYS.forEach(k=>a.g.w[k]=Math.round(((a.g.w[k]+b.g.w[k])/2)*100)/100);
-        a.g.n=Math.min(5,Math.max(a.g.n,b.g.n));
-        a.mergedFrom=[{id:a.id,name:a.name,g:JSON.parse(JSON.stringify(a.g))},{id:b.id,name:b.name,g:JSON.parse(JSON.stringify(b.g))}];
-        const newName=a.name.slice(0,Math.ceil(a.name.length/2))+b.name.slice(Math.floor(b.name.length/2));
-        a.log.push({d:dt,note:`FUSED with ${b.name} — our genomes disagreed enough to be complementary (similarity ${(genomeSim(a.g,b.g)*100).toFixed(0)}%). Now operating as ${newName}. ${describeGenome(a.g)}`});
-        mutAlert(L,'merge',`🧬 ${a.name} + ${b.name} have merged into ${newName} — complementary strategies, both top-30% fitness. The colony is now ${activeMutants(L).length-1} strong.`);
-        a.name=newName; a.chgAt=dt; a.rec.cs=0;
-        b.absorbed=a.id;
-        break outer;
-      }
-    }
-  }
-  // UNFUSE: a merged mutant on a 3-day slide petitions ADMIN, splits next day
-  for(const m of act){
-    if(m.mergedFrom && !m.unfusePending && m.rec.cl>=3){
-      m.unfusePending=dt;
-      mutAlert(L,'admin',`⚠️ ADMIN: ${m.name} (a fusion) has lost 3 straight days and requests to un-fuse back into ${m.mergedFrom[0].name} + ${m.mergedFrom[1].name}. Auto-approving on the next cycle unless the colony turns.`);
-    } else if(m.mergedFrom && m.unfusePending && m.unfusePending!==dt){
-      const [pa,pb]=m.mergedFrom;
-      m.name=pa.name; m.g=pa.g; m.mergedFrom=null; m.unfusePending=null; m.chgAt=dt; m.rec.cs=0; m.rec.cl=0;
-      m.log.push({d:dt,note:`Un-fused by ADMIN approval — reverted to ${pa.name}'s original genome.`});
-      const b=L.mut.roster[pb.id];
-      if(b){ b.absorbed=null; b.g=pb.g; b.rec.cs=0; b.rec.cl=0; b.log.push({d:dt,note:`Released from the ${pa.name} fusion — back to my own genome. ${describeGenome(b.g)}`}); }
-      mutAlert(L,'admin',`✂️ Un-fuse executed: ${pa.name} and ${pb.name} are independent mutants again. Colony ${activeMutants(L).length}.`);
-    }
-  }
-  L.mut.evoDone[dt]=true;
-  const keep={}; Object.keys(L.mut.evoDone).sort().slice(-15).forEach(k=>keep[k]=true); L.mut.evoDone=keep;
-}
-function uNum(u){ return (u>=0?'+':'')+u.toFixed(1)+'u'; }
+  if (board && board.rows.length) {
+    /* --- 3. odds --- */
+    const oc = await fetchOdds(core, date);
+    const matched = applyOddsToBoard(board, oc);
+    if (matched) log('odds on board:', matched, 'hitters priced');
+    core.boardCache = { rows: board.rows, hasLineups: board.hasLineups };
 
-// ---------- main ----------
-const __main=(async()=>{ if(process.env.MUT_TEST==='1') return;
-  const date=todayISO();
-  console.log('runner build',RUNNER_BUILD,'· ET date',date);
-  const L=await loadLedger();
-  console.log('ledger loaded:',Object.keys(L.days||{}).length,'day(s) · mutants in blob:',L.mut?Object.keys(L.mut.roster).length:0);
-  mutInit(L);   // the colony exists from the very first run, games or not
-  await settle(L);
-  const board=await buildBoard(date, L);
-  if(!board){
-    console.log('EARLY EXIT: no completed schedule/games returned for',date,'— saving colony state and sleeping');
-    wire(L,'sys','No MLB games found for '+date+' — colony state saved, back to sleep.');
-    await saveLedger(L); return; }
-  const {rows}=board; rows.forEach((r,i)=>r.rank=i+1);
-  const now=Date.now();
-  const pitchTime=r=>r.firstPitch?new Date(r.firstPitch).getTime():now+3e7;
-  const signals=await scanNews(rows);
-  signals.forEach((why,id)=>{ const r=rows.find(x=>x.id===id); if(r) wire(L,'wire',`⚠ ${r.name}: ${why}`); });
+    /* --- record board into ledger (preserves existing picks/results) --- */
+    recordBoard(core, date, board.rows);
+    // backfill missing pick odds now that prices exist
+    if (oc?.prices) {
+      const d = core.days[date];
+      Object.values(d.rows).forEach(r => {
+        const v = oc.prices[normName(r.n)];
+        if (v != null) {
+          if (r.od == null) r.od = v;
+          if (r.picked && r.pickOdds == null) r.pickOdds = v;
+          if (r.bot && r.botOdds == null) r.botOdds = v;
+          if (r.mit && r.mitOdds == null) r.mitOdds = v;
+          if (r.bks) Object.keys(r.bks).forEach(b => { if (r.bks[b] == null) r.bks[b] = v; });
+        }
+        const e = oc.ou?.[normName(r.n)];
+        if (e && r.ou) Object.values(r.ou).forEach(x => { if (x.odds == null && x.line === e.line) x.odds = x.side === 'O' ? e.over : e.under; });
+      });
+    }
 
-  for(const st of STRATS){
-    const bot=NAMES[st.id];
-    const wanted=st.pick(rows.filter(r=>!signals.has(r.id) && pitchTime(r)>now && !holdsOUOver05(L,date,st.id,r.id))); // never flagged/started/duplicate-of-O/U
-    const have=currentPicks(L,date,st.id);
-    if(have.length) console.log(bot+': holding '+have.length+' locked pick(s), checking for scratches…');
-    if(!have.length){
-      if(!wanted.length){ console.log(bot+': passes (nothing qualifies yet)'); continue; }
-      wanted.forEach(r=>setPick(L,date,st.id,r));
-      wire(L,st.id,`${bot} filed: ${wanted.map(r=>r.name).join(', ')}${wanted.some(r=>r.dkOdds==null)?' (some unpriced)':''}`);
-      continue;
+    /* --- 4. news scan → wire flags --- */
+    const flags = await scanNews(board.rows);
+    for (const [id, f] of flags) {
+      const r = board.rows.find(x => x.id === id);
+      const already = (core.wire || []).some(w => Date.now() - w.t < 12 * 3600 * 1000 && w.text.includes(r.name) && w.who === 'wire');
+      if (!already) wire(core, 'wire', '⚠ ' + r.name + ' flagged — ' + f.reason + ' [' + f.src + ']');
     }
-    // REVISIONS — only while the pick's game hasn't started
-    for(const id of have){
-      const r=rows.find(x=>x.id===id);
-      const started = r ? pitchTime(r)<=now : true;
-      if(started) continue;
-      const flagged=signals.has(id);
-      const scratched = r && Object.values(rows.filter(x=>x.teamId===r.teamId&&x.confirmed)).length>0 && !r.confirmed;
-      if(flagged||scratched){
-        unpick(L,date,st.id,id);
-        const pool_=st.pick(rows.filter(x=>!signals.has(x.id)&&pitchTime(x)>now&&!hasPick(L,date,st.id,x.id)&&!holdsOUOver05(L,date,st.id,x.id)));
-        const sub=pool_.find(x=>x.id!==id);
-        if(sub) setPick(L,date,st.id,sub);
-        wire(L,st.id,`${bot} changed his mind: OUT ${r?.name||id} (${flagged?'news: '+signals.get(id).slice(0,90):'not in the posted lineup'})${sub?' → IN '+sub.name:''}`);
-      }
-    }
+
+    /* --- 5. file cards (once prices/lineups exist), then revise --- */
+    const filable = board.rows.some(r => r.dkOdds != null) || board.hasLineups;
+    if (filable) fileCards(core, board, date, flags);
+    else log('cards not filed yet — waiting for prices or posted lineups.');
+    reviseCards(core, board, date, flags);
+
+    /* --- 6. mutants file today --- */
+    mutantsFile(colony, core, board, date);
   }
-  console.log('board:',rows.length,'hitters ·',rows.filter(r=>r.confirmed).length,'confirmed ·',rows.filter(r=>r.dkOdds!=null).length,'priced ·',signals.size,'news flags');
-  fileOU(L, date, rows.filter(r=>!signals.has(r.id)), now, pitchTime);
-  const pitchById={}; rows.forEach(r=>pitchById[r.id]=pitchTime(r));
-  steamFile(L, date, id=>(pitchById[id]??Infinity)>now);
-  mutantsPick(L, date, rows.filter(r=>!signals.has(r.id)), now, pitchTime);
-  mutantsEvolve(L, daysAgo(date,1));
-  await saveLedger(L);
-  console.log('run complete', new Date().toISOString());
-})();
-if(process.env.MUT_TEST!=='1') await __main;   // ensures the run completes before the process exits
-export {steamFile,catWL,mutInit,mutantsPick,mutantsSettle,mutantsEvolve,activeMutants,pruneLedger,emergencyTrim};
+
+  /* --- 7. write colony bin --- */
+  await binWrite(colonyBinId, colony);
+  // small mirror on the core bin so the dashboard shows the colony even before
+  // it follows the mutBinId pointer (roster trimmed to essentials to stay light)
+  core.mut = { roster: colony.mut.roster, alerts: colony.mut.alerts.slice(-15), series: colony.mut.series };
+  core.mdays = (() => { const dts = Object.keys(colony.mdays).sort().slice(-2); const o = {}; dts.forEach(d => o[d] = colony.mdays[d]); return o; })();
+
+  /* --- 8. merge-safe core write: re-read, merge days, preserve everything --- */
+  let latest = null;
+  try { latest = await binRead(JSONBIN_BIN); } catch (e) { /* write ours */ }
+  const localChangedDays = core.days;
+  const finalRecord = { ...(latest || {}), ...core };
+  finalRecord.days = mergeDays(latest?.days || remoteSnapshot, localChangedDays);
+  // runner-side merge: for rows the runner graded, runner's result wins
+  await binWrite(JSONBIN_BIN, finalRecord);
+
+  log('=== done in', ((Date.now() - t0) / 1000).toFixed(0) + 's ===');
+})().catch(e => { console.error('RUNNER FATAL:', e.stack || e.message || e); process.exit(1); });
