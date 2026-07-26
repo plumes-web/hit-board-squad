@@ -1004,8 +1004,52 @@ function spawnColony() {
   }
   return { mut: { roster, alerts: [{ k: 'admin', t: Date.now(), msg: 'Colony spawned: 100 mutants online, DNA randomized. Evolution begins at first settlement.' }], series: [] }, mdays: {} };
 }
+/* Migrate a colony inherited from the old dashboard spawner (or any partial data)
+   into the shape this runner needs. Records, names, locks and history are kept;
+   only missing/incompatible DNA is re-sequenced (seeded from the mutant id so
+   it stays stable across runs). */
+function normalizeColony(colony) {
+  let fixed = 0;
+  colony.mut = colony.mut || {};
+  colony.mut.roster = colony.mut.roster || {};
+  colony.mut.alerts = Array.isArray(colony.mut.alerts) ? colony.mut.alerts : [];
+  colony.mut.series = Array.isArray(colony.mut.series) ? colony.mut.series : [];
+  colony.mdays = colony.mdays || {};
+  const NEED = ['form', 'pit', 'plat', 'bvp', 'park', 'streak', 'xba', 'kInv', 'price'];
+  for (const [id, m] of Object.entries(colony.mut.roster)) {
+    if (!m || typeof m !== 'object') { delete colony.mut.roster[id]; fixed++; continue; }
+    m.id = m.id || id;
+    const badDNA = !m.dna || typeof m.dna !== 'object' || !m.dna.w || typeof m.dna.w !== 'object' ||
+      !NEED.some(k => typeof m.dna.w[k] === 'number');
+    if (badDNA) {
+      const seed = [...String(m.id)].reduce((a, c) => (a * 33 + c.charCodeAt(0)) >>> 0, 5381);
+      m.dna = mkDNA(rng(seed));
+      m.log = Array.isArray(m.log) ? m.log : [];
+      m.log.push({ t: Date.now(), note: 'DNA re-sequenced on migration. ' + dnaDesc(m.dna) });
+      fixed++;
+    } else {
+      // fill any newly-added knobs with sane defaults
+      if (typeof m.dna.n !== 'number') m.dna.n = 3;
+      if (typeof m.dna.ouBias !== 'number') m.dna.ouBias = 0.3;
+      if (typeof m.dna.fade !== 'boolean') m.dna.fade = false;
+      if (typeof m.dna.minScore !== 'number') m.dna.minScore = 45;
+    }
+    const r0 = m.rec && typeof m.rec === 'object' ? m.rec : {};
+    m.rec = { w: r0.w | 0, l: r0.l | 0, ow: r0.ow | 0, ol: r0.ol | 0,
+      u: typeof r0.u === 'number' ? r0.u : 0, ouU: typeof r0.ouU === 'number' ? r0.ouU : 0,
+      hist: Array.isArray(r0.hist) ? r0.hist : [] };
+    m.locked = !!m.locked; m.absorbed = !!m.absorbed;
+    if (!Array.isArray(m.log)) m.log = [{ t: Date.now(), note: dnaDesc(m.dna) }];
+  }
+  if (fixed) {
+    colony.mut.alerts.push({ k: 'admin', t: Date.now(), msg: 'Migration: ' + fixed + ' mutant(s) re-sequenced to the new DNA format. Records preserved.' });
+    log('colony migration: re-sequenced', fixed, 'legacy mutant(s)');
+  }
+  return colony;
+}
 function mutScore(m, r) {
-  const w = m.dna.w;
+  const w = m?.dna?.w;
+  if (!w) return null; // legacy/malformed mutant — normalizeColony() should have fixed it, but never crash
   const feats = {
     form: r.fForm, pit: r.fPit, plat: r.fPlat, bvp: r.fBvp,
     park: scale(r.park?.pf, 94, 112),
@@ -1178,11 +1222,13 @@ function evolveColony(colony, dt) {
   colony.mut.alerts = colony.mut.alerts || [];
   colony.mut.series = colony.mut.series || [];
   colony.mdays = colony.mdays || {};
+  normalizeColony(colony); // migrate any legacy dashboard-format mutants safely
 
   /* --- 1. settle ledger + mutants (shared results cache) --- */
   const hitsCache = {};
   await settle(core, hitsCache);
-  await mutantsSettle(colony, hitsCache);
+  try { await mutantsSettle(colony, hitsCache); }
+  catch (e) { log('⚠ mutant settlement failed (colony skipped this run):', e.message); }
 
   /* --- 2. today's board (full rebuild at most every 3h; cheap refresh otherwise) --- */
   let board = null;
@@ -1241,16 +1287,19 @@ function evolveColony(colony, dt) {
     else log('cards not filed yet — waiting for prices or posted lineups.');
     reviseCards(core, board, date, flags);
 
-    /* --- 6. mutants file today --- */
-    mutantsFile(colony, core, board, date);
+    /* --- 6. mutants file today (isolated — a colony error must never cost the ledger) --- */
+    try { mutantsFile(colony, core, board, date); }
+    catch (e) { log('⚠ mutant filing failed (colony skipped this run):', e.message); }
   }
 
   /* --- 7. write colony bin --- */
-  await binWrite(colonyBinId, colony);
-  // small mirror on the core bin so the dashboard shows the colony even before
-  // it follows the mutBinId pointer (roster trimmed to essentials to stay light)
-  core.mut = { roster: colony.mut.roster, alerts: colony.mut.alerts.slice(-15), series: colony.mut.series };
-  core.mdays = (() => { const dts = Object.keys(colony.mdays).sort().slice(-2); const o = {}; dts.forEach(d => o[d] = colony.mdays[d]); return o; })();
+  try {
+    await binWrite(colonyBinId, colony);
+    // small mirror on the core bin so the dashboard shows the colony even before
+    // it follows the mutBinId pointer (roster trimmed to essentials to stay light)
+    core.mut = { roster: colony.mut.roster, alerts: colony.mut.alerts.slice(-15), series: colony.mut.series };
+    core.mdays = (() => { const dts = Object.keys(colony.mdays).sort().slice(-2); const o = {}; dts.forEach(d => o[d] = colony.mdays[d]); return o; })();
+  } catch (e) { log('⚠ colony write failed:', e.message); }
 
   /* --- 8. merge-safe core write: re-read, merge days, preserve everything --- */
   let latest = null;
