@@ -30,7 +30,25 @@ if (!JSONBIN_KEY || !JSONBIN_BIN) {
 
 const API = 'https://statsapi.mlb.com/api/v1';
 const JB  = 'https://api.jsonbin.io/v3/b';
-const HDR = { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY };
+// jsonbin has two key types with different headers. Try the key as a Master Key
+// first; if jsonbin rejects a write/read with 401/403, retry it as an Access Key.
+const HDR_MASTER = { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY };
+const HDR_ACCESS = { 'Content-Type': 'application/json', 'X-Access-Key': JSONBIN_KEY };
+let HDR = HDR_MASTER;
+const KEY_HELP = ' — the key can read this bin but not update it. This usually means the ' +
+  'JSONBIN_KEY secret is an Access Key without Update permission, or a key from a ' +
+  'different jsonbin account than the one that owns the bin. Fix: jsonbin.io → API Keys → ' +
+  'copy the MASTER key (starts with $2a$/$2b$) into the JSONBIN_KEY repo secret, or edit ' +
+  'the Access Key and enable Update on Bins.';
+async function jbFetch(url, opts) {
+  let r = await fetch(url, { ...opts, headers: { ...HDR, ...(opts.extra || {}) } });
+  if ((r.status === 401 || r.status === 403)) {
+    const alt = HDR === HDR_MASTER ? HDR_ACCESS : HDR_MASTER;
+    const r2 = await fetch(url, { ...opts, headers: { ...alt, ...(opts.extra || {}) } });
+    if (r2.ok) { HDR = alt; log('jsonbin: switched to', alt === HDR_ACCESS ? 'X-Access-Key' : 'X-Master-Key', 'auth'); return r2; }
+  }
+  return r;
+}
 
 /* ---------------- small utils (mirrors of the dashboard's helpers) -------- */
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
@@ -96,17 +114,17 @@ function parseCSV(text) {
 
 /* ---------------- jsonbin: merge-safe read / write ------------------------ */
 async function binRead(binId) {
-  const r = await fetch(`${JB}/${binId}/latest`, { headers: HDR });
-  if (!r.ok) throw new Error('jsonbin read ' + binId + ': HTTP ' + r.status);
+  const r = await jbFetch(`${JB}/${binId}/latest`, {});
+  if (!r.ok) throw new Error('jsonbin read ' + binId + ': HTTP ' + r.status + (r.status === 403 ? KEY_HELP : ''));
   return (await r.json()).record;
 }
 async function binWrite(binId, record) {
-  const r = await fetch(`${JB}/${binId}`, { method: 'PUT', headers: HDR, body: JSON.stringify(record) });
-  if (!r.ok) throw new Error('jsonbin write ' + binId + ': HTTP ' + r.status);
+  const r = await jbFetch(`${JB}/${binId}`, { method: 'PUT', body: JSON.stringify(record) });
+  if (!r.ok) throw new Error('jsonbin write ' + binId + ': HTTP ' + r.status + (r.status === 403 ? KEY_HELP : ''));
 }
 async function binCreate(name, record) {
-  const r = await fetch(JB, { method: 'POST', headers: { ...HDR, 'X-Bin-Name': name, 'X-Bin-Private': 'true' }, body: JSON.stringify(record) });
-  if (!r.ok) throw new Error('jsonbin create: HTTP ' + r.status);
+  const r = await jbFetch(JB, { method: 'POST', extra: { 'X-Bin-Name': name, 'X-Bin-Private': 'true' }, body: JSON.stringify(record) });
+  if (!r.ok) throw new Error('jsonbin create: HTTP ' + r.status + (r.status === 403 ? KEY_HELP : ''));
   return (await r.json()).metadata.id;
 }
 /* deep-merge one ledger row: dashboard edits and runner edits both survive */
@@ -1206,6 +1224,11 @@ function evolveColony(colony, dt) {
   core.version = core.version || 1;
   core.days = core.days || {};
   const remoteSnapshot = JSON.parse(JSON.stringify(core.days)); // for merge-safe write later
+
+  /* --- write-permission probe: fail fast (before any real work) if the key can
+         read but not update, instead of losing the whole run at the end --- */
+  try { await binWrite(JSONBIN_BIN, core); }
+  catch (e) { throw new Error('FATAL — jsonbin write test failed at startup. ' + e.message); }
 
   /* --- load / create colony bin --- */
   let colonyBinId = core.mutBinId || null;
