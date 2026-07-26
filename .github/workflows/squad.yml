@@ -6,6 +6,13 @@ on:
     - cron: '0,30 0-3 * * *'
   workflow_dispatch: {}   # manual "Run now" button in the Actions tab
 
+permissions:
+  contents: read
+
+concurrency:
+  group: squad-runner        # never let two runs write the bin at once
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -15,6 +22,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Verify runner exists
+        run: test -f autonomous/runner.mjs || { echo "::error::autonomous/runner.mjs is missing from the repo — the workflow has nothing to run. Upload the autonomous/ folder."; exit 1; }
       - name: Run the squad
         env:
           JSONBIN_KEY: ${{ secrets.JSONBIN_KEY }}
