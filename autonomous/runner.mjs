@@ -120,7 +120,37 @@ async function binRead(binId) {
 }
 async function binWrite(binId, record) {
   const r = await jbFetch(`${JB}/${binId}`, { method: 'PUT', body: JSON.stringify(record) });
-  if (!r.ok) throw new Error('jsonbin write ' + binId + ': HTTP ' + r.status + (r.status === 403 ? KEY_HELP : ''));
+  if (!r.ok) {
+    let body = ''; try { body = (await r.text()).slice(0, 200); } catch {}
+    throw new Error('jsonbin write ' + binId + ': HTTP ' + r.status + (body ? ' — ' + body : '') + (r.status === 403 ? KEY_HELP : ''));
+  }
+}
+/* jsonbin free plan caps bins at ~100KB and answers oversized PUTs with 403.
+   writeFit measures the payload and applies shrink steps until it fits. */
+const BIN_CAP = 95_000;
+function roundDeep(o) {
+  if (Array.isArray(o)) return o.map(roundDeep);
+  if (o && typeof o === 'object') { const r = {}; for (const [k, v] of Object.entries(o)) r[k] = roundDeep(v); return r; }
+  if (typeof o === 'number' && !Number.isInteger(o)) return Math.round(o * 1000) / 1000;
+  return o;
+}
+async function writeFit(binId, record, label, steps) {
+  record = roundDeep(record);
+  let body = JSON.stringify(record);
+  for (const [name, fn] of steps) {
+    if (body.length <= BIN_CAP) break;
+    fn(record);
+    record = roundDeep(record);
+    body = JSON.stringify(record);
+    log('✂', label, 'over the free-plan bin cap — applied:', name, '→', (body.length / 1024).toFixed(0) + 'KB');
+  }
+  if (body.length > BIN_CAP) log('⚠', label, 'still', (body.length / 1024).toFixed(0) + 'KB after trimming — jsonbin may reject it (free plan caps bins at ~100KB; a paid plan lifts this).');
+  const r = await jbFetch(`${JB}/${binId}`, { method: 'PUT', body });
+  if (!r.ok) {
+    let msg = ''; try { msg = (await r.text()).slice(0, 200); } catch {}
+    throw new Error('jsonbin write ' + binId + ' (' + label + ', ' + (body.length / 1024).toFixed(0) + 'KB): HTTP ' + r.status + (msg ? ' — ' + msg : ''));
+  }
+  log(label, 'saved (' + (body.length / 1024).toFixed(0) + 'KB)');
 }
 async function binCreate(name, record) {
   const r = await jbFetch(JB, { method: 'POST', extra: { 'X-Bin-Name': name, 'X-Bin-Private': 'true' }, body: JSON.stringify(record) });
@@ -1164,10 +1194,14 @@ function mutantsSettle(colony, hitsCache) {
       log('mutants settled', dt, '· colony', (colonyDay >= 0 ? '+' : '') + colonyDay.toFixed(1) + 'u');
       evolveColony(colony, dt);
     }
-    // prune old mdays to keep the bin lean (standings live in rec/series)
-    const keep = Object.keys(colony.mdays).sort().slice(-14);
+    // prune old mdays to keep the bin lean (standings live in rec/series):
+    // last 7 days kept, and why-strings dropped from anything older than 2 days
+    const keep = Object.keys(colony.mdays).sort().slice(-7);
     const pruned = {}; keep.forEach(dt => pruned[dt] = colony.mdays[dt]);
     colony.mdays = pruned;
+    Object.keys(colony.mdays).sort().slice(0, -2).forEach(dt =>
+      Object.values(colony.mdays[dt].rows || {}).forEach(row =>
+        Object.values(row.mk || {}).forEach(pk => { if (pk?.length > 5) pk[5] = ''; })));
     colony.mut.alerts = (colony.mut.alerts || []).slice(-40);
     return settledDays;
   })();
@@ -1315,12 +1349,35 @@ function evolveColony(colony, dt) {
     catch (e) { log('⚠ mutant filing failed (colony skipped this run):', e.message); }
   }
 
-  /* --- 7. write colony bin --- */
+  /* --- 7. write colony bin (size-aware — free plan caps bins at ~100KB) --- */
   try {
-    await binWrite(colonyBinId, colony);
-    // small mirror on the core bin so the dashboard shows the colony even before
-    // it follows the mutBinId pointer (roster trimmed to essentials to stay light)
-    core.mut = { roster: colony.mut.roster, alerts: colony.mut.alerts.slice(-15), series: colony.mut.series };
+    // routine hygiene before measuring
+    Object.values(colony.mut.roster).forEach(m => { if (m.log?.length > 6) m.log = m.log.slice(-6); });
+    colony.mut.alerts = colony.mut.alerts.slice(-40);
+    await writeFit(colonyBinId, colony, 'colony', [
+      ['prune pick sheets to last 10 days', c => { const ks = Object.keys(c.mdays).sort().slice(0, -10); ks.forEach(k => delete c.mdays[k]); }],
+      ['strip why-strings from older pick sheets', c => { const ks = Object.keys(c.mdays).sort().slice(0, -2); ks.forEach(k => Object.values(c.mdays[k].rows || {}).forEach(row => Object.values(row.mk || {}).forEach(pk => { if (pk?.length > 5) pk[5] = ''; }))); }],
+      ['prune pick sheets to last 5 days', c => { const ks = Object.keys(c.mdays).sort().slice(0, -5); ks.forEach(k => delete c.mdays[k]); }],
+      ['cap mutant logs to last 3 entries', c => Object.values(c.mut.roster).forEach(m => { if (m.log?.length > 3) m.log = m.log.slice(-3); })],
+      ['cap alerts to last 20', c => { c.mut.alerts = c.mut.alerts.slice(-20); }],
+      ['cap per-mutant history to last 30 days', c => Object.values(c.mut.roster).forEach(m => { if (m.rec?.hist?.length > 30) m.rec.hist = m.rec.hist.slice(-30); })],
+      ['strip all remaining why-strings', c => Object.values(c.mdays).forEach(md => Object.values(md.rows || {}).forEach(row => Object.values(row.mk || {}).forEach(pk => { if (pk?.length > 5) pk[5] = ''; })))],
+      ['prune pick sheets to last 2 days', c => { const ks = Object.keys(c.mdays).sort().slice(0, -2); ks.forEach(k => delete c.mdays[k]); }],
+      ['cap per-mutant history to last 12 days', c => Object.values(c.mut.roster).forEach(m => { if (m.rec?.hist?.length > 12) m.rec.hist = m.rec.hist.slice(-12); })],
+      ['cap mutant logs to last entry', c => Object.values(c.mut.roster).forEach(m => { if (m.log?.length > 1) m.log = m.log.slice(-1); })],
+      ['keep only today\'s pick sheet', c => { const ks = Object.keys(c.mdays).sort().slice(0, -1); ks.forEach(k => delete c.mdays[k]); }]
+    ]);
+    // slim mirror on the core bin: enough for the dashboard to render the colony
+    // panel instantly; the full colony lives in its own bin behind mutBinId
+    core.mut = {
+      roster: Object.fromEntries(Object.entries(colony.mut.roster).map(([id, m]) => [id, {
+        id, name: m.name, dna: m.dna, locked: m.locked, absorbed: m.absorbed, mergedFrom: m.mergedFrom || null,
+        rec: { ...m.rec, hist: (m.rec.hist || []).slice(-10) },
+        log: (m.log || []).slice(-1)
+      }])),
+      alerts: colony.mut.alerts.slice(-15),
+      series: colony.mut.series
+    };
     core.mdays = (() => { const dts = Object.keys(colony.mdays).sort().slice(-2); const o = {}; dts.forEach(d => o[d] = colony.mdays[d]); return o; })();
   } catch (e) { log('⚠ colony write failed:', e.message); }
 
@@ -1330,8 +1387,35 @@ function evolveColony(colony, dt) {
   const localChangedDays = core.days;
   const finalRecord = { ...(latest || {}), ...core };
   finalRecord.days = mergeDays(latest?.days || remoteSnapshot, localChangedDays);
-  // runner-side merge: for rows the runner graded, runner's result wins
-  await binWrite(JSONBIN_BIN, finalRecord);
+  // the Savant sheet (~1,300 players) is bigger than the whole free-plan bin cap;
+  // it's cheap to refetch on each 3h rebuild, so it never gets persisted
+  delete finalRecord.statCache;
+  await writeFit(JSONBIN_BIN, finalRecord, 'core', [
+    ['slim board cache to per-hitter essentials', rec => {
+      if (!rec.boardCache?.rows) return;
+      const KEEP = ['id', 'name', 'team', 'teamId', 'game', 'opp', 'gamePk', 'firstPitch', 'gameState', 'confirmed', 'order', 'expAB',
+        'score', 'rank', 'estP', 'fForm', 'fPit', 'fPlat', 'fBvp', 'bvpConf', 'park', 'streak',
+        'l15Avg', 'l15G', 'l15GwAB', 'l15HitG', 'avgVsL', 'avgVsR', 'bvpAB', 'bvpH', 'bvpPA', 'bvpAvg',
+        'st', 'dkOdds', 'dkImplied', 'edge', 'ouLine', 'ouOver', 'ouUnder', 'mitEdge', 'mitTag', 'seasonAvg', 'bats', 'pitHand'];
+      rec.boardCache.rows = rec.boardCache.rows.map(r => { const o = {}; KEEP.forEach(k => { if (r[k] !== undefined) o[k] = r[k]; }); return o; });
+    }],
+    ['trim wire to last 80 entries', rec => { if (Array.isArray(rec.wire)) rec.wire = rec.wire.slice(-80); }],
+    ['drop colony mirror mdays to 1 day', rec => { const ks = Object.keys(rec.mdays || {}).sort().slice(0, -1); ks.forEach(k => delete rec.mdays[k]); }],
+    ['slim colony mirror roster', rec => {
+      if (!rec.mut?.roster) return;
+      rec.mut.roster = Object.fromEntries(Object.entries(rec.mut.roster).map(([id, m]) => [id,
+        { id, name: m.name, locked: m.locked, absorbed: m.absorbed, rec: { w: m.rec?.w | 0, l: m.rec?.l | 0, u: m.rec?.u || 0, ouU: m.rec?.ouU || 0 }, log: (m.log || []).slice(-1) }]));
+    }],
+    ['trim wire to last 40 entries', rec => { if (Array.isArray(rec.wire)) rec.wire = rec.wire.slice(-40); }],
+    ['prune fully-settled ledger days older than 45 days', rec => {
+      const cutoff = new Date(Date.now() - 45 * 86400e3).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+      for (const [d, day] of Object.entries(rec.days || {})) {
+        if (d >= cutoff) continue;
+        const rows = Object.values(day.rows || {});
+        if (rows.length && rows.every(r => r.res != null)) delete rec.days[d];
+      }
+    }]
+  ]);
 
   log('=== done in', ((Date.now() - t0) / 1000).toFixed(0) + 's ===');
 })().catch(e => { console.error('RUNNER FATAL:', e.stack || e.message || e); process.exit(1); });
